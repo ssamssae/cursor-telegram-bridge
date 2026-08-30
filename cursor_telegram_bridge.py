@@ -69,6 +69,9 @@ TUI_IDLE_SEC = float_env("CUB_TUI_IDLE_SEC", 8.0)
 TUI_WAIT_SEC = int_env("CUB_TUI_WAIT_SEC", 900, minimum=10)
 TUI_BUSY_INJECT = bool_env("CUB_BUSY_INJECT", True)
 TUI_FALLBACK_HEADLESS = bool_env("CUB_TUI_FALLBACK_HEADLESS", True)
+TUI_MIRROR_LOCAL = bool_env("CUB_TUI_MIRROR_LOCAL", False)
+TUI_MIRROR_LOCAL_INTERVAL = float_env("CUB_TUI_MIRROR_LOCAL_INTERVAL", 5.0)
+TUI_MIRROR_LOCAL_PROMPT_MAX = int_env("CUB_TUI_MIRROR_LOCAL_PROMPT_MAX", 300, minimum=20)
 CURSOR_BIN = env("CUB_CURSOR_BIN", "cursor-agent")
 TRANSCRIPT_ROOT = env(
     "CUB_TRANSCRIPT_ROOT",
@@ -108,6 +111,7 @@ _HEALTH_LOCK = threading.Lock()
 _HARVEST_GEN = 0
 _LAST_FINAL_BODY = ""
 _LAST_FINAL_LOCK = threading.Lock()
+_HARVEST_LOCK = threading.Lock()
 _HEALTH = {
     "pid": os.getpid(),
     "name": NAME,
@@ -287,6 +291,42 @@ def assistant_texts(rows):
     return out
 
 
+def user_query_text(row):
+    """Cursor 가 감싼 <user_query> 본문. 없으면 평문."""
+    if (row or {}).get("role") != "user":
+        return ""
+    raw = "\n".join(_content_texts(row)).strip()
+    if not raw:
+        return ""
+    open_at = raw.find("<user_query>")
+    close_at = raw.find("</user_query>")
+    if open_at >= 0 and close_at > open_at:
+        return raw[open_at + len("<user_query>"):close_at].strip()
+    ts_open = raw.find("<timestamp>")
+    ts_close = raw.find("</timestamp>")
+    if ts_open >= 0 and ts_close > ts_open:
+        raw = (raw[:ts_open] + raw[ts_close + len("</timestamp>"):]).strip()
+    return raw
+
+
+def assistant_final_pairs(rows):
+    """[(질문, 최종답), ...] — 텍스트-only assistant 행만. tool_use 섞이면 생각 중."""
+    last_q = ""
+    out = []
+    for row in rows or []:
+        if row.get("role") == "user":
+            q = user_query_text(row)
+            if q:
+                last_q = q
+            continue
+        if row.get("role") != "assistant" or row_has_tool_use(row):
+            continue
+        joined = "\n".join(_content_texts(row)).strip()
+        if joined:
+            out.append((last_q, joined))
+    return out
+
+
 def assistant_final_texts(rows):
     """텍스트만 있는 assistant 행. 같은 줄에 tool_use 가 있으면 생각 중이라 최종이 아니다."""
     out = []
@@ -386,6 +426,11 @@ def harvest_orphaned_finals(path):
     경로가 처음이면 현재 개수로만 초기화한다 — 과거 일기장을 폰에 쏟지 않는다.
     새 텔레그램이 앞 잡을 취소해도, 이미 끝난 텍스트-only 답은 여기서 건진다.
     """
+    with _HARVEST_LOCK:
+        return _harvest_orphaned_finals_locked(path)
+
+
+def _harvest_orphaned_finals_locked(path):
     if not path:
         return 0
     rows = read_transcript_rows(path)
@@ -412,6 +457,71 @@ def harvest_orphaned_finals(path):
     if sent:
         print(f"{LOG_KEY} orphaned final harvest {sent}건", flush=True)
     return sent
+
+
+def _mirror_prompt_body(question):
+    head = (question or "").strip()
+    if not head:
+        return ""
+    if len(head) > TUI_MIRROR_LOCAL_PROMPT_MAX:
+        head = head[:TUI_MIRROR_LOCAL_PROMPT_MAX] + " …"
+    return f"터미널에서 물어본 것 — {head}"
+
+
+def mirror_local_tui_turns():
+    """tmux 창에 직접 친 턴을 폰으로 올린다. 그록 GRB_TUI_MIRROR_LOCAL 동형.
+
+    켠 순간 과거 일기장은 안 쏟는다. 텔레그램 잡이 도는 동안엔 비킨다.
+    생각 중(tool_use)이면 답이 끝날 때까지 기다린다.
+    """
+    if not TUI_MIRROR_LOCAL:
+        return 0
+    if _TUI_JOB_ACTIVE.is_set():
+        return 0
+    path = newest_transcript_path()
+    if not path:
+        return 0
+    with _HARVEST_LOCK:
+        rows = read_transcript_rows(path)
+        if tail_is_busy(rows):
+            return 0
+        pairs = assistant_final_pairs(rows)
+        rec = load_cursor_state()
+        if rec.get("path") != str(path) or rec.get("finals_sent") is None:
+            save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(pairs))
+            return 0
+        try:
+            already = int(rec.get("finals_sent") or 0)
+        except (TypeError, ValueError):
+            already = 0
+        if already > len(pairs):
+            already = len(pairs)
+        last = str(rec.get("last_final") or "")
+        sent = 0
+        for question, answer in pairs[already:]:
+            if not answer or answer == last:
+                continue
+            prompt = _mirror_prompt_body(question)
+            if prompt:
+                deliver_mesh_event("report", prompt)
+            deliver_mesh_event("final", answer)
+            last = answer
+            sent += 1
+        save_cursor(path, len(rows), last_final=last, finals_sent=len(pairs))
+        if sent:
+            print(f"{LOG_KEY} local mirror {sent}건", flush=True)
+        return sent
+
+
+def tui_local_mirror_ticker():
+    while True:
+        time.sleep(TUI_MIRROR_LOCAL_INTERVAL)
+        try:
+            sent = mirror_local_tui_turns()
+            if sent:
+                print(f"{LOG_KEY} local mirror tick {sent}건", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{LOG_KEY} local mirror 실패: {exc}", file=sys.stderr)
 
 
 def wait_for_final(path, baseline, deadline, gen=None):
@@ -871,10 +981,16 @@ def typing_loop():
 
 
 def main():
-    print(f"{LOG_KEY} start name={NAME} node={NODE_KEY} session={TMUX_SESSION} dry={int(DRY_RUN)}", flush=True)
+    print(
+        f"{LOG_KEY} start name={NAME} node={NODE_KEY} session={TMUX_SESSION} "
+        f"dry={int(DRY_RUN)} mirror={int(TUI_MIRROR_LOCAL)}",
+        flush=True,
+    )
     threading.Thread(target=worker_loop, name="cub-worker", daemon=True).start()
     health_mark(worker_alive=True)
     threading.Thread(target=typing_loop, name="cub-typing", daemon=True).start()
+    if TUI_MIRROR_LOCAL:
+        threading.Thread(target=tui_local_mirror_ticker, name="cub-tui-mirror", daemon=True).start()
     if DRY_RUN:
         return
     drain_pending_updates()

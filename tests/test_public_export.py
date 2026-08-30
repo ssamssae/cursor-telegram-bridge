@@ -25,6 +25,7 @@ class PublicExportTest(unittest.TestCase):
         self.assertEqual(mod.CHAT_ID, "111222333")
         self.assertEqual(mod.NAME, "cursor")
         self.assertEqual(mod.TMUX_SESSION, "cursor")
+        self.assertFalse(mod.TUI_MIRROR_LOCAL)
 
     def test_chat_id_has_no_default(self):
         source = BRIDGE.read_text(encoding="utf-8")

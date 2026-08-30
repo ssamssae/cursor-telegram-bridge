@@ -196,6 +196,12 @@ Then start the bridge in another terminal. If you do not want the fallback at
 all, set `CUB_TUI_FALLBACK_HEADLESS=0` — the phone will tell you the session is
 down instead of silently switching lanes.
 
+Turns you type directly in that tmux pane stay on the machine unless you turn
+mirroring on. Set `CUB_TUI_MIRROR_LOCAL=1` and the bridge will also send those
+questions and answers to Telegram (a short "you asked this in the terminal"
+line, then the finished answer). Off by default so a first install does not
+dump old terminal history onto your phone.
+
 ## Settings
 
 Every setting is an environment variable. Only the first two are required.
@@ -208,6 +214,7 @@ Every setting is an environment variable. Only the first two are required.
 | `CUB_TMUX_SESSION` | `cursor` | tmux session the TUI lane pastes into. |
 | `CUB_TUI_WAIT_SEC` | `900` | Seconds to wait for one turn before giving up. |
 | `CUB_TUI_FALLBACK_HEADLESS` | `1` | Set `0` to refuse work when the tmux session is gone. |
+| `CUB_TUI_MIRROR_LOCAL` | `0` | Set `1` to also send turns typed in the tmux session to Telegram. |
 | `CUB_STATE_DIR` | `~/.cursor-telegram-bridge/state` | Where offsets and harvest cursors are kept. |
 | `CUB_DRY_RUN` | `0` | Set `1` to run without calling Cursor at all. |
 
