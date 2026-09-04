@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -91,6 +92,56 @@ class PublicExportTest(unittest.TestCase):
         ]
         self.assertFalse(mod.tail_is_busy(rows))
         self.assertTrue(mod.turn_has_ended(rows))
+
+    def test_trailing_suggested_reply_is_split(self):
+        mod = load_bridge("cub_suggested")
+        open_m = "<" + "추천답변" + ">"
+        close_m = "</" + "추천답변" + ">"
+        self.assertEqual(
+            mod.split_suggested_reply("hello\n" + open_m + "yes" + close_m),
+            ("hello", "yes"),
+        )
+        self.assertEqual(mod.split_suggested_reply("hello"), ("hello", ""))
+
+    def test_suggested_reply_sends_confirm_button(self):
+        mod = load_bridge("cub_suggested_button")
+        mod.DRY_RUN = False
+        calls = []
+        with mock.patch.object(
+            mod,
+            "tg",
+            lambda method, timeout=60, **params: calls.append((method, params))
+            or {"ok": True, "result": {"message_id": len(calls)}},
+        ):
+            open_m = "<" + "추천답변" + ">"
+            close_m = "</" + "추천답변" + ">"
+            mod.deliver_cursor_answer("본문\n" + open_m + "이어서 해줘" + close_m)
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds, ["sendMessage", "sendMessage"])
+        self.assertEqual(calls[0][1]["text"], "본문")
+        self.assertNotIn("reply_markup", calls[0][1])
+        self.assertEqual(calls[1][1]["text"], "이어서 해줘")
+        markup = calls[1][1]["reply_markup"]
+        self.assertIn("확인", markup)
+        self.assertEqual(json.loads(markup)["inline_keyboard"][0][0]["text"], "확인")
+        self.assertEqual(len(json.loads(markup)["inline_keyboard"][0]), 1)
+        self.assertIn("cub-sr", markup)
+
+    def test_untagged_answer_sends_only_the_body(self):
+        """No marker, no synthetic suggestion chip (same contract as the sister bridges)."""
+        mod = load_bridge("cub_default_chip")
+        mod.DRY_RUN = False
+        calls = []
+        with mock.patch.object(
+            mod,
+            "tg",
+            lambda method, timeout=60, **params: calls.append((method, params))
+            or {"ok": True, "result": {"message_id": len(calls)}},
+        ):
+            mod.deliver_cursor_answer("태그 없는 답\n\n둘째 단락도 그대로 간다.")
+        self.assertEqual([c[0] for c in calls], ["sendMessage"])
+        self.assertEqual(calls[0][1]["text"], "태그 없는 답\n\n둘째 단락도 그대로 간다.")
+        self.assertNotIn("reply_markup", calls[0][1])
 
 
 if __name__ == "__main__":

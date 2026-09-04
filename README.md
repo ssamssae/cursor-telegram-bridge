@@ -61,12 +61,33 @@ file" still makes sense.
 You do not get a wall of tool output. What you do get:
 
 - **The finished answer**, as one or more Telegram messages.
+- **A suggestion bubble + confirm button**, when the answer ends with a
+  `<추천답변>…</추천답변>` marker. Tapping confirm sends that line as the next
+  turn, same as the Grok bridge.
 - **A typing indicator** while Cursor is still working.
 - **No mid-turn tool dump.** The bridge waits until Cursor has written a
   text-only answer (and, on current Cursor builds, a turn-ended marker).
 
 If a turn overruns the wait, or the bridge restarts while Cursor is still
 writing, a late answer is recovered instead of being thrown away.
+
+## Commands From Telegram
+
+These work in the TUI lane (a live `cursor` tmux session):
+
+| You send | What happens |
+| --- | --- |
+| `/model` | A button menu of Cursor models. Tap one and the bridge switches the Cursor session to it (`CUB_MODEL_MENU` sets the list). |
+| `/model opus 5` | Switch straight to the first model whose name contains that text, no menu. |
+| `/context` | Cursor's own context usage line comes back to your phone. |
+| `/clear` | Starts a fresh Cursor conversation, same as typing it in the terminal. |
+| `/status` | One line: is the bridge polling, is the worker alive, how deep is the queue. |
+
+When Cursor stops on a tool-approval prompt, the bridge sends a
+**▶ Run Everything** button. Tapping it answers the prompt in the terminal for
+you (Cursor's Shift+Tab). If Cursor opens its model picker in the terminal,
+the same `/model` menu shows up on your phone so you can finish the choice
+from there.
 
 ## What You Need
 
@@ -215,6 +236,10 @@ Every setting is an environment variable. Only the first two are required.
 | `CUB_TUI_WAIT_SEC` | `900` | Seconds to wait for one turn before giving up. |
 | `CUB_TUI_FALLBACK_HEADLESS` | `1` | Set `0` to refuse work when the tmux session is gone. |
 | `CUB_TUI_MIRROR_LOCAL` | `0` | Set `1` to also send turns typed in the tmux session to Telegram. |
+| `CUB_MODEL_MENU` | built-in list | Comma-separated model names shown as `/model` buttons. |
+| `CUB_MODEL_SURFACE` | `1` | Set `0` to turn off the `/model` menu and the picker mirror. |
+| `CUB_APPROVAL_SURFACE` | `1` | Set `0` to stop sending the Run Everything button on approval prompts. |
+| `CUB_PHONE_MAX_LINES` | `0` | `0` sends the whole answer. A positive number cuts the phone copy at that many lines. |
 | `CUB_STATE_DIR` | `~/.cursor-telegram-bridge/state` | Where offsets and harvest cursors are kept. |
 | `CUB_DRY_RUN` | `0` | Set `1` to run without calling Cursor at all. |
 
