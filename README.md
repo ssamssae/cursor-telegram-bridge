@@ -234,6 +234,11 @@ Every setting is an environment variable. Only the first two are required.
 | `CUB_CURSOR_BIN` | `cursor-agent` | Path to the CLI, if it is not on your `PATH`. |
 | `CUB_TMUX_SESSION` | `cursor` | tmux session the TUI lane pastes into. |
 | `CUB_TUI_WAIT_SEC` | `900` | Seconds to wait for one turn before giving up. |
+| `CUB_TUI_WAIT_MAX_SEC` | `7200` | Hard cap: keep waiting past `CUB_TUI_WAIT_SEC` while Cursor is still running tools (no headless re-run of the same prompt). |
+| `CUB_TUI_BUSY_STALL_SEC` | `900` | While extended, give up if the transcript stops growing for this long. |
+| `CUB_STRIP_TRAILING_REASONING` | `1` | Drop first-person English reasoning paragraphs that Cursor sometimes appends after a non-English final answer. Set `0` to keep them. |
+| `CUB_CONTEXT_CLEAR_PCT` | `50` | When the session is idle and Cursor's status line shows context usage at or above this percent, the bridge sends `/clear` for you and reports it once. `0` turns the guard off. |
+| `CUB_CONTEXT_CLEAR_COOLDOWN_SEC` | `600` | Minimum seconds between two automatic `/clear`s from the context guard. |
 | `CUB_TUI_FALLBACK_HEADLESS` | `1` | Set `0` to refuse work when the tmux session is gone. |
 | `CUB_TUI_MIRROR_LOCAL` | `0` | Set `1` to also send turns typed in the tmux session to Telegram. |
 | `CUB_MODEL_MENU` | built-in list | Comma-separated model names shown as `/model` buttons. |

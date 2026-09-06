@@ -78,13 +78,26 @@ if TUI_SUBMIT_CONFIRM_WAIT < 0:
 TUI_SUBMIT_RETRY = int_env("CUB_TUI_SUBMIT_RETRY", 1, minimum=0)
 TUI_POLL_INTERVAL = float_env("CUB_TUI_POLL_INTERVAL", 0.5)
 TUI_PASTE_RESOLVE_SEC = float_env("CUB_TUI_PASTE_RESOLVE_SEC", 3.0)
+# paste 토큰이 옛 일기장 마지막 user 와 같아도, job 시작 전 mtime 은 후보에서 뺀다.
+TRANSCRIPT_PICK_MTIME_SLACK_SEC = float_env("CUB_TRANSCRIPT_PICK_MTIME_SLACK_SEC", 5.0)
 TUI_IDLE_SEC = float_env("CUB_TUI_IDLE_SEC", 8.0)
 TUI_WAIT_SEC = int_env("CUB_TUI_WAIT_SEC", 900, minimum=10)
+# 턴이 아직 도는 중(도구 호출·일기장 성장)이면 TUI_WAIT_SEC 를 넘겨도 기다린다 — 하드캡.
+# 2026-09-04 23:33 live fire: 24분짜리 턴이 15분 캡에 걸려 헤드리스 cursor-agent 가
+# 같은 프롬프트를 다시 돌렸다(중복 작업자) + 진짜 답은 폰에 안 갔다.
+TUI_WAIT_MAX_SEC = int_env("CUB_TUI_WAIT_MAX_SEC", 7200, minimum=10)
+# 연장 중 일기장이 이 시간 동안 한 줄도 안 자라면 멈춘 턴으로 보고 포기한다.
+TUI_BUSY_STALL_SEC = int_env("CUB_TUI_BUSY_STALL_SEC", 900, minimum=30)
 TUI_BUSY_INJECT = bool_env("CUB_BUSY_INJECT", True)
 TUI_FALLBACK_HEADLESS = bool_env("CUB_TUI_FALLBACK_HEADLESS", True)
 TUI_MIRROR_LOCAL = bool_env("CUB_TUI_MIRROR_LOCAL", False)
 TUI_MIRROR_LOCAL_INTERVAL = float_env("CUB_TUI_MIRROR_LOCAL_INTERVAL", 5.0)
 TUI_MIRROR_LOCAL_PROMPT_MAX = int_env("CUB_TUI_MIRROR_LOCAL_PROMPT_MAX", 300, minimum=20)
+# T-260906-011: idle 컨텍스트 가드. 상태줄 % 만 읽고 /context 주입은 하지 않는다.
+# PCT=0 이면 끔. 쿨다운 기본 600초. awaiting-human 은 세우지 않는다.
+CUB_CONTEXT_CLEAR_PCT = int_env("CUB_CONTEXT_CLEAR_PCT", 50, minimum=0)
+CUB_CONTEXT_CLEAR_COOLDOWN_SEC = int_env("CUB_CONTEXT_CLEAR_COOLDOWN_SEC", 600, minimum=0)
+_CONTEXT_GUARD_LAST_AT = 0.0
 CURSOR_BIN = env("CUB_CURSOR_BIN", "cursor-agent")
 TRANSCRIPT_ROOT = env(
     "CUB_TRANSCRIPT_ROOT",
@@ -133,6 +146,20 @@ SUGGESTED_CLOSE = "</" + "추천답변" + ">"
 # 발신 래퍼가 4096 단위로 한다). 2026-09-04 11:4x 「장난해?」— 진행 보고가 2줄에서
 # 잘려 「오늘 진행 상황 정리입니다. **완료**」만 도착했다. 양수면 그 줄 수에서 자른다.
 PHONE_FACING_MAX_LINES = int_env("CUB_PHONE_MAX_LINES", 0, minimum=0)
+# 2026-09-04 23:16 live fire: Cursor 일기장이 최종답 텍스트 블록 *뒤에* 그 턴의 생각 요약
+# (영문 1인칭 산문 4~7단락)을 이어 붙였다. 폰에 "I also want to add ops/…" 버블이 갔다.
+# 답 본문이 한글인데 꼬리가 한글 0·1인칭 영문 산문 덩어리면 그 덩어리를 걷는다.
+STRIP_TRAILING_REASONING = bool_env("CUB_STRIP_TRAILING_REASONING", True)
+_REASONING_OPENER_RE = re.compile(
+    r"^(?:I|I'm|I’m|I'll|I’ll|I've|I’ve|I'd|I’d|Now I|So I|My plan|Let me|The user)\b"
+)
+# 2026-09-05 19:34 live fire: 꼬리가 "The diff check didn't show anything conclusive, …
+# so I can go ahead and answer the user." — 첫 단어가 1인칭이 아니라 위 opener 를 비껴갔다.
+# 생각 요약은 어디선가 반드시 1인칭(I/me/my)이나 "the user" 를 쓴다. 덩어리 안 어디든 있으면 리즈닝.
+_REASONING_FIRST_PERSON_RE = re.compile(
+    r"\b(?:I|I'm|I’m|I'll|I’ll|I've|I’ve|I'd|I’d|me|my|the user)\b"
+)
+_HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
 _PHONE_MARKER_RE = re.compile(r"\[REDACTED\]|\[sol-cycle[^\]]*\]", re.IGNORECASE)
 _PHONE_DUMP_LINE_RE = re.compile(
     r"(?:^|\b)(?:CONFLICTING|DIRTY)\b|^\s*##\s+main\b|^\s*cub_tui_lane\b|^\s*grb_tui_lane\b",
@@ -159,6 +186,15 @@ _PHONE_AGENT_META_LINE_RE = re.compile(
     rf")"
 )
 TELEGRAM_ORIGIN_PROMPTS_MAX = 32
+# T-260905-006 — 오케 배차 운반체는 사람이 터미널에 친 질문이 아니다.
+# 미러가 첫 줄 `[claude-skills HEAD: …]` 를 「터미널에서 물어본 것」으로 폰에 에코하면
+# 사용자가 「뭐냐이게」가 된다. 답은 보내고 라벨만 뺀다.
+_DISPATCH_CARRIER_RE = re.compile(r"\[directive-carrier nonce:\s*carrier-\d+")
+_DISPATCH_HEAD_RE = re.compile(
+    r"^\[(?:claude-skills HEAD|CLAUDE-REVIEW-ROUTE|NODE-ACK-)",
+    re.MULTILINE,
+)
+_DISPATCH_ROUTE_RE = re.compile(r"^from=\S+\s*\|?\s*task=", re.MULTILINE)
 
 if not DRY_RUN:
     if not TOKEN_FILE or not os.path.isfile(TOKEN_FILE):
@@ -182,6 +218,7 @@ HEALTH_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.health.json")
 INBOX_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.inbox.jsonl")
 CURSOR_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.tui-cursor.json")
 TUI_INFLIGHT_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.tui-inflight.json")
+HEADLESS_TRANSCRIPTS_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.headless-transcripts.json")
 SUGGESTED_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.suggested.json")
 MODEL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.model.json")
 APPROVAL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.approval.json")
@@ -190,6 +227,11 @@ API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 JOBS: queue.Queue = queue.Queue()
 _TUI_JOB_ACTIVE = threading.Event()
 _TYPING_ACTIVE = threading.Event()
+# 잡이 없는데도 커서 턴이 도는 중(로컬 타이핑 · busy 삽입 뒤 앞 턴 final 로 잡이 먼저 닫힘 ·
+# 정체 15분 넘겨 wait 만 끝남). local mirror 가 일기장 꼬리를 읽을 때마다 갱신하고
+# typing_loop 가 이걸 보고 「입력 중…」을 유지한다 (2026-09-06 00:2x 사용자 「진행하고있는데
+# 입력중에 표시가안된다」).
+_TUI_TURN_BUSY = threading.Event()
 _HEALTH_LOCK = threading.Lock()
 _HARVEST_GEN = 0
 _LAST_FINAL_BODY = ""
@@ -775,6 +817,28 @@ def parse_tui_context_percent(screen):
         match = TUI_CONTEXT_PERCENT_RE.search(line)
         if match:
             return match.group(1)
+    return _parse_wrapped_context_percent(screen)
+
+
+# 좁은 pane(≤60col) 에서 상태줄이 두 줄로 접힌다:
+#   "  Cursor Grok   · 87.9· 60 files     Run Everything"
+#   "  4.6 High        %     edited"
+# 숫자와 % 가 다른 줄에 떨어져 위 정규식이 전부 None → 컨텍스트 가드가 침묵한다 (T-260906-011 후속).
+TUI_CONTEXT_WRAPPED_NUM_RE = re.compile(r"·\s*(\d+(?:\.\d+)?)\s*·")
+TUI_CONTEXT_WRAPPED_PCT_RE = re.compile(r"(?:^|\s)%(?:\s|$)")
+
+
+def _parse_wrapped_context_percent(screen):
+    rows = (screen or "").splitlines()
+    for idx in range(len(rows) - 1, 0, -1):
+        line, prev = rows[idx], rows[idx - 1]
+        if not TUI_CONTEXT_WRAPPED_PCT_RE.search(line):
+            continue
+        if _tui_context_line_is_free(prev) or _tui_context_line_is_free(line):
+            continue
+        match = TUI_CONTEXT_WRAPPED_NUM_RE.search(prev)
+        if match:
+            return match.group(1)
     return None
 
 
@@ -843,22 +907,82 @@ def _transcript_has_pasted_user(path, pasted_text):
     return False
 
 
+def _job_started_at():
+    """inflight/job 시각. 없으면 지금 — 옛 mtime 일기장을 토큰 매칭에서 빼기 위해."""
+    job = _tui_inflight_load()
+    if job:
+        for key in ("started_at", "ts", "job_started_at"):
+            try:
+                val = float(job.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val > 0:
+                return val
+    try:
+        started = float(_HEALTH.get("last_job_started_at") or 0)
+    except (TypeError, ValueError):
+        started = 0.0
+    if started > 0:
+        return started
+    return time.time()
+
+
+def _transcript_mtime_fresh_for_job(path, started_at=None, slack=None):
+    slack = TRANSCRIPT_PICK_MTIME_SLACK_SEC if slack is None else float(slack)
+    started = _job_started_at() if started_at is None else float(started_at)
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        return False
+    return mtime >= (started - slack)
+
+
+def _stale_token_transcript(path, token, started_at, rows=None):
+    """같은 질문이 마지막 user 여도 job 시작 전 mtime 이면 오선택 후보다."""
+    if not token or not path:
+        return False
+    if _transcript_mtime_fresh_for_job(path, started_at):
+        return False
+    if rows is None:
+        return _transcript_has_pasted_user(path, token)
+    for row in reversed(rows):
+        if row.get("role") != "user":
+            continue
+        q = user_query_text(row) or "\n".join(_content_texts(row)).strip()
+        return token in q or q == token
+    return False
+
+
 def _pick_active_transcript_path(prior_path=None, pasted_text=None):
     """한 번 스캔 — paste 직후 mtime-only newest 가 옛 일기장일 수 있다."""
     paths = list_transcript_paths()
     if not paths:
         return None
     token = (pasted_text or "").strip()
+    started = _job_started_at()
+
+    def usable(path, rows=None):
+        rows = read_transcript_rows(path) if rows is None else rows
+        if transcript_is_aborted_only(rows):
+            return False
+        return not _stale_token_transcript(path, token, started, rows)
+
     if token:
         for path in reversed(paths):
             rows = read_transcript_rows(path)
-            if transcript_is_aborted_only(rows):
+            if not usable(path, rows):
                 continue
             if _transcript_has_pasted_user(path, token):
                 return path
+    # 붙여넣은 글이 아직 어디에도 없으면 방금 붙여넣은 TUI 일기장(prior)을 지킨다.
+    # mtime 최신이 다른 세션 일기장이면 그쪽으로 튀어 영영 '침묵'으로 보인다.
+    # 토큰이 옛 일기장에만 있으면 그쪽으로 떨어지지 않는다 (T-260905-005).
+    if prior_path:
+        prior = Path(prior_path)
+        if prior in paths and usable(prior):
+            return prior
     for path in reversed(paths):
-        rows = read_transcript_rows(path)
-        if not transcript_is_aborted_only(rows):
+        if usable(path):
             return path
     return paths[-1]
 
@@ -917,7 +1041,7 @@ def _tui_inflight_clear():
         pass
 
 
-def _inflight_payload(path, baseline, source, text, *, prior_path=None):
+def _inflight_payload(path, baseline, source, text, *, prior_path=None, started_at=None):
     preview = (text or "").strip().splitlines()[0][:80] if text else ""
     payload = {
         "path": str(path or ""),
@@ -925,6 +1049,7 @@ def _inflight_payload(path, baseline, source, text, *, prior_path=None):
         "source": source or "telegram",
         "text": text or "",
         "preview": preview,
+        "started_at": float(started_at if started_at is not None else time.time()),
     }
     if prior_path:
         payload["prior_path"] = str(prior_path)
@@ -1097,14 +1222,18 @@ def handle_tui_reset(source="telegram"):
     """TUI /clear|/new — 브릿지 대기·회수·확인버튼을 먼저 비우고 Cursor 에 /clear 를 넣는다.
 
     슬래시 팔레트가 뜨면 Esc 로 접지 않고 TUI `/clear`(Start a new chat) 를 Enter 로 확정.
+    source=context-guard (T-260906-011) 는 awaiting-human 을 세우지 않는다.
+    세우면 이후 오케 directive 가 「/clear 이후 기계 주입 폐기」로 버려진다.
+    기존 awaiting-human 파일도 건드리지 않는다 (clear_awaiting_human 호출 금지).
     """
-    del source
     global _HARVEST_GEN
+    auto = source == "context-guard"
     _TUI_RESET.set()
     _HARVEST_GEN += 1
     dropped = drain_pending_jobs()
     forget_suggested_replies()
-    set_awaiting_human()
+    if not auto:
+        set_awaiting_human()
     reset_cursor_harvest_state()
     _tui_inflight_clear()
     if dropped:
@@ -1115,13 +1244,59 @@ def handle_tui_reset(source="telegram"):
         except Exception as exc:  # noqa: BLE001
             deliver_mesh_event("error", f"커서 /clear 주입 실패: {exc}")
             _TUI_RESET.clear()
-            return
+            return False
     else:
         deliver_mesh_event("error", tui_dead_message())
         _TUI_RESET.clear()
-        return
-    notify_tui_cleared()
+        return False
+    if not auto:
+        notify_tui_cleared()
     _TUI_RESET.clear()
+    return True
+
+
+def maybe_auto_clear_idle_context(now=None, screen=None):
+    """Idle + 상태줄 used% ≥ CUB_CONTEXT_CLEAR_PCT 이면 /clear. /context 주입 금지.
+
+    판정은 idle 에서만: 잡·턴 busy·대기 큐·compose 입력·approval/model picker 없음.
+    성공 시에만 쿨다운을 열고 report 1줄을 보낸다. T-260906-011.
+    """
+    global _CONTEXT_GUARD_LAST_AT
+    if CUB_CONTEXT_CLEAR_PCT <= 0:
+        return False
+    now = time.time() if now is None else float(now)
+    if _CONTEXT_GUARD_LAST_AT and (now - _CONTEXT_GUARD_LAST_AT) < CUB_CONTEXT_CLEAR_COOLDOWN_SEC:
+        return False
+    if _TUI_JOB_ACTIVE.is_set() or _TUI_TURN_BUSY.is_set():
+        return False
+    if not JOBS.empty():
+        return False
+    if screen is None:
+        screen = _tui_capture_pane()
+    if not _tui_compose_is_placeholder(screen):
+        return False
+    if _tui_pane_shows_approval_overlay(screen) or _tui_pane_shows_model_picker(screen):
+        return False
+    raw = parse_tui_context_percent(screen)
+    if raw is None:
+        return False
+    try:
+        used = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if used < CUB_CONTEXT_CLEAR_PCT:
+        return False
+    if not tui_session_alive():
+        return False
+    if not handle_tui_reset(source="context-guard"):
+        return False
+    _CONTEXT_GUARD_LAST_AT = now
+    deliver_mesh_event(
+        "report",
+        f"컨텍스트 {raw}% — 자동 /clear 했어. 진행 중 작업은 tasks.md 로 재개.",
+    )
+    print(f"{LOG_KEY} context-guard {raw}% → /clear", file=sys.stderr)
+    return True
 
 
 def with_suggested_tail_instruction(text):
@@ -1173,7 +1348,7 @@ def _tui_paste(prompt, *, interrupt=False):
     _tui_confirm_submit(original, path)
 
 
-def list_transcript_paths(root=None):
+def _all_transcript_paths(root=None):
     base = Path(root or TRANSCRIPT_ROOT)
     if not base.is_dir():
         return []
@@ -1185,6 +1360,31 @@ def list_transcript_paths(root=None):
             continue
     out.sort(key=lambda item: item[0])
     return [p for _, p in out]
+
+
+def load_headless_transcripts():
+    rec = _tui_json_load(HEADLESS_TRANSCRIPTS_FILE)
+    paths = rec.get("paths") if isinstance(rec, dict) else None
+    return {str(p) for p in (paths or []) if p}
+
+
+def remember_headless_transcripts(new_paths):
+    """헤드리스 `cursor-agent -p` 가 만든 일기장은 TUI 일기장 후보에서 영구 제외한다.
+
+    mtime 최신순 선택이 헤드리스 일기장을 집으면 TUI 는 영영 '침묵'으로 보이고, 그 일기장의
+    옛 답이 폰으로 재발송된다 (9/5 macOS 노드).
+    """
+    fresh = {str(p) for p in new_paths if p}
+    if not fresh:
+        return
+    known = load_headless_transcripts()
+    known |= fresh
+    _tui_json_save(HEADLESS_TRANSCRIPTS_FILE, {"paths": sorted(known)[-200:]})
+
+
+def list_transcript_paths(root=None):
+    skip = load_headless_transcripts()
+    return [p for p in _all_transcript_paths(root) if str(p) not in skip]
 
 
 def newest_transcript_path(root=None):
@@ -1422,6 +1622,16 @@ def is_telegram_origin_prompt(question):
     return key in seen
 
 
+def is_dispatch_prompt(question):
+    """오케/함대 배차 본문인가. 문자열 추측이 아니라 운반체 표식 3종."""
+    raw = question or ""
+    return bool(
+        _DISPATCH_CARRIER_RE.search(raw)
+        or _DISPATCH_HEAD_RE.search(raw)
+        or _DISPATCH_ROUTE_RE.search(raw)
+    )
+
+
 def bind_cursor_if_needed(path, finals_upto_rows=None):
     if not path:
         return
@@ -1452,34 +1662,38 @@ def _harvest_orphaned_finals_locked(path):
     path_s = str(path)
     bound_path = str(rec.get("path") or "")
     if bound_path != path_s:
-        if not bound_path or rec.get("finals_sent") is None:
-            job = _tui_inflight_load()
-            if job and str(job.get("path") or "") == path_s:
-                try:
-                    inflight_baseline = int(job.get("baseline") or 0)
-                except (TypeError, ValueError):
-                    inflight_baseline = 0
-                prior_texts = assistant_final_texts(rows[: max(inflight_baseline, 0)])
-                save_cursor(
-                    path,
-                    len(rows),
-                    last_final=str(rec.get("last_final") or ""),
-                    finals_sent=len(prior_texts),
-                )
-                rec = load_cursor_state(path)
-                try:
-                    already = int(rec.get("finals_sent") or 0)
-                except (TypeError, ValueError):
-                    already = 0
-                if already > len(texts):
-                    already = len(texts)
-                last = str(rec.get("last_final") or "")
-            else:
-                save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(texts))
-                return 0
-        else:
+        # 일기장이 바뀌었다(첫 바인딩이든, 다른 일기장에서 옮겨 왔든). 옮겨 온 일기장의
+        # 과거 답을 통째로 쏟으면 안 된다 — inflight 잡이 이 일기장을 가리키면 그 baseline
+        # 뒤 답만, 아니면 현재 개수로 커서만 맞춘다. (9/5 macOS 노드: 헤드리스 일기장→TUI 일기장
+        # 전환에 옛 답 10건이 폰으로 재발송된 사고.)
+        job = _tui_inflight_load()
+        if job and str(job.get("path") or "") == path_s:
+            try:
+                inflight_baseline = int(job.get("baseline") or 0)
+            except (TypeError, ValueError):
+                inflight_baseline = 0
+            prior_texts = assistant_final_texts(rows[: max(inflight_baseline, 0)])
+            save_cursor(
+                path,
+                len(rows),
+                last_final=str(rec.get("last_final") or ""),
+                finals_sent=len(prior_texts),
+            )
+            rec = load_cursor_state(path)
+            try:
+                already = int(rec.get("finals_sent") or 0)
+            except (TypeError, ValueError):
+                already = 0
+            if already > len(texts):
+                already = len(texts)
+            last = str(rec.get("last_final") or "")
+        elif bound_path and rec.get("finals_sent") is not None and transcript_is_aborted_only(read_transcript_rows(bound_path)):
+            # /clear 가 남긴 aborted-only 핀 → 같은 세션의 새 일기장. 새 일기장은 새 답만 있다.
             already = 0
             last = ""
+        else:
+            save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(texts))
+            return 0
     elif rec.get("finals_sent") is None:
         save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(texts))
         return 0
@@ -1502,6 +1716,51 @@ def _harvest_orphaned_finals_locked(path):
     if sent:
         print(f"{LOG_KEY} orphaned final harvest {sent}건", flush=True)
     return sent
+
+
+def _is_reasoning_prose_para(para):
+    """코드 펜스·표·목록이 아닌, 한글 0 인 영문 산문 단락."""
+    s = para.strip()
+    if not s or "```" in s:
+        return False
+    if _HANGUL_RE.search(s):
+        return False
+    first = s.lstrip()
+    if first.startswith(("|", "- ", "* ", "#", ">", "[")) or re.match(r"^\d+[.)]\s", first):
+        return False
+    return sum(ch.isalpha() for ch in s) >= 40
+
+
+def strip_trailing_reasoning(text):
+    """한글 답 뒤에 이어 붙은 영문 생각 요약 덩어리를 걷는다.
+
+    조건 전부: (1) 꼬리 단락들이 한글 0 영문 산문, (2) 그 앞 본문에 한글이 있다,
+    (3) 덩어리 첫 단락이 1인칭 리즈닝 어투("I'm …", "I should …", "The user …")로 시작.
+    영어 대화(본문에 한글 없음)엔 손대지 않는다 — 공개 배포 사용자 무영향.
+    """
+    if not STRIP_TRAILING_REASONING:
+        return text
+    raw = str(text or "")
+    if "\n\n" not in raw:
+        return text
+    paras = raw.split("\n\n")
+    cut = len(paras)
+    while cut > 0 and _is_reasoning_prose_para(paras[cut - 1]):
+        cut -= 1
+    if cut == len(paras) or cut == 0:
+        return text
+    head = "\n\n".join(paras[:cut])
+    if not _HANGUL_RE.search(head):
+        return text
+    tail_block = "\n\n".join(paras[cut:])
+    if not (
+        _REASONING_OPENER_RE.match(paras[cut].strip())
+        or _REASONING_FIRST_PERSON_RE.search(tail_block)
+    ):
+        return text
+    dropped = len(paras) - cut
+    print(f"{LOG_KEY} 꼬리 생각요약 {dropped}단락 걷음", flush=True)
+    return head.rstrip()
 
 
 def phone_facing_answer(text, max_lines=None):
@@ -1553,6 +1812,8 @@ def _is_phone_agent_meta_line(s):
 
 def _mirror_prompt_body(question):
     # 터미널 질문 미러는 머리글 2줄만 — 답 본문(무제한)과 다른 축.
+    if is_dispatch_prompt(question):
+        return ""
     head = phone_facing_answer(question or "", max_lines=2)
     if not head:
         return ""
@@ -1573,11 +1834,14 @@ def mirror_local_tui_turns():
         return 0
     path = newest_transcript_path()
     if not path:
+        _TUI_TURN_BUSY.clear()
         return 0
     with _HARVEST_LOCK:
         rows = read_transcript_rows(path)
         if tail_is_busy(rows):
+            _TUI_TURN_BUSY.set()
             return 0
+        _TUI_TURN_BUSY.clear()
         pairs = assistant_final_pairs(rows)
         rec = load_cursor_state()
         if rec.get("path") != str(path) or rec.get("finals_sent") is None:
@@ -1623,9 +1887,12 @@ def tui_local_mirror_ticker():
     while True:
         time.sleep(TUI_MIRROR_LOCAL_INTERVAL)
         try:
+            # 틱마다 pane 캡처 1회 — idle 가드와 공유. /context 주입 금지 (T-260906-011).
+            screen = _tui_capture_pane()
             sent = mirror_local_tui_turns()
             if sent:
                 print(f"{LOG_KEY} local mirror tick {sent}건", file=sys.stderr)
+            maybe_auto_clear_idle_context(screen=screen)
         except Exception as exc:  # noqa: BLE001
             print(f"{LOG_KEY} local mirror 실패: {exc}", file=sys.stderr)
 
@@ -1640,15 +1907,53 @@ def _maybe_rebind_active_transcript(path, baseline, prior_path, pasted_text):
         return path, baseline, False
     if not _transcript_has_pasted_user(active, token):
         return path, baseline, False
-    bind_cursor_if_needed(active, 0)
-    return active, 0, True
+    rows_at_bind = len(read_transcript_rows(active))
+    if _transcript_mtime_fresh_for_job(active):
+        bind_cursor_if_needed(active, 0)
+        new_baseline = 0
+    else:
+        bind_cursor_if_needed(active, rows_at_bind)
+        new_baseline = rows_at_bind
+    job = _tui_inflight_load()
+    if job:
+        started = job.get("started_at")
+        job["path"] = str(active)
+        job["baseline"] = new_baseline
+        _tui_inflight_write(
+            _inflight_payload(
+                active,
+                new_baseline,
+                job.get("source"),
+                job.get("text") or token,
+                prior_path=prior_path or job.get("prior_path"),
+                started_at=started,
+            )
+        )
+    return active, new_baseline, True
+
+
+def turn_still_running(rows, last_change, now=None, hard_deadline=None):
+    """기본 대기(TUI_WAIT_SEC)를 넘겼어도 커서가 아직 도구를 돌리는 중이면 True.
+
+    일기장 꼬리가 busy(도구 호출·사용자 행)이고, 최근 TUI_BUSY_STALL_SEC 안에 한 줄이라도
+    자랐으면 살아 있는 턴이다. 하드캡(TUI_WAIT_MAX_SEC)을 넘기면 무조건 False.
+    붙여넣기가 제출조차 안 된 경우는 꼬리가 busy 가 아니므로 예전처럼 TUI_WAIT_SEC 에 끝난다.
+    """
+    now = time.time() if now is None else now
+    if hard_deadline is not None and now >= hard_deadline:
+        return False
+    if not tail_is_busy(rows):
+        return False
+    return (now - last_change) < TUI_BUSY_STALL_SEC
 
 
 def wait_for_final(path, baseline, deadline, gen=None, *, pasted_text=None, prior_path=None):
     last_len = baseline
     last_change = time.time()
     last_answer = ""
-    while time.time() < deadline:
+    hard_deadline = deadline - TUI_WAIT_SEC + max(TUI_WAIT_MAX_SEC, TUI_WAIT_SEC)
+    extended = False
+    while True:
         if _TUI_RESET.is_set():
             return "", path
         if gen is not None and gen != _HARVEST_GEN:
@@ -1668,8 +1973,17 @@ def wait_for_final(path, baseline, deadline, gen=None, *, pasted_text=None, prio
         if last_answer and not tail_is_busy(rows):
             if turn_has_ended(rows) or (time.time() - last_change) >= TUI_IDLE_SEC:
                 return last_answer, path
+        now = time.time()
+        if now >= deadline:
+            if not turn_still_running(rows, last_change, now, hard_deadline):
+                return last_answer, path
+            if not extended:
+                extended = True
+                print(
+                    f"{LOG_KEY} 턴 아직 진행 중 — 대기 연장 (하드캡 {TUI_WAIT_MAX_SEC}s)",
+                    flush=True,
+                )
         time.sleep(TUI_POLL_INTERVAL)
-    return last_answer, path
 
 
 TG_CHUNK = int_env("CUB_TG_CHUNK", 4096, minimum=1)
@@ -2341,6 +2655,7 @@ def deliver_cursor_answer(text, task_id=None):
     추천답변 버블. 명령 버블만 telegram_code_entity=True. <추천답변> 마커가
     없는 답에는 추천 문구를 합성하지 않는다(Claude·Grok 동일).
     """
+    text = strip_trailing_reasoning(text)
     body, suggested = (
         split_suggested_reply(text) if SUGGESTED_REPLY_SPLIT else (text, "")
     )
@@ -2388,6 +2703,7 @@ def run_headless(prompt):
     ]
     if DRY_RUN:
         return f"[dry-run] cursor-agent {prompt[:40]}"
+    before = {str(p) for p in _all_transcript_paths()}
     try:
         proc = subprocess.run(
             cmd,
@@ -2398,6 +2714,11 @@ def run_headless(prompt):
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return f"헤드리스 커서 실행 실패: {exc}"
+    finally:
+        try:
+            remember_headless_transcripts({str(p) for p in _all_transcript_paths()} - before)
+        except OSError:
+            pass
     out = (proc.stdout or "").strip()
     return out or (proc.stderr or "").strip() or "헤드리스 커서가 빈 답을 냈어."
 
@@ -2456,7 +2777,10 @@ def process_job(source, text, meta=None):
                 # /clear 뒤 새 일기장으로 갈리면 옛 baseline 을 가져가면
                 # wait_for_final 이 이미 적힌 답을 못 본다 (live fire 2026-09-01).
                 if path and prior_path and str(path) != str(prior_path):
-                    baseline = 0
+                    if _transcript_mtime_fresh_for_job(path):
+                        baseline = 0
+                    else:
+                        baseline = len(read_transcript_rows(path))
                 if path:
                     bind_cursor_if_needed(path, baseline)
                     _tui_inflight_write(
@@ -2490,6 +2814,16 @@ def process_job(source, text, meta=None):
             _tui_inflight_clear()
             return
         if gen != _HARVEST_GEN:
+            return
+        if path and tui_session_alive() and tail_is_busy(read_transcript_rows(path)):
+            # 커서가 아직 그 턴을 돌리는 중이다(하드캡·정체로 대기만 끝남). 헤드리스로
+            # 같은 프롬프트를 다시 돌리면 작업자가 둘이 된다 — 대신 알리고, 답은
+            # inflight 회수·local mirror 가 턴이 끝난 뒤 배달한다.
+            deliver_mesh_event(
+                "report",
+                f"커서가 {_elapsed_words(time.time() - (deadline - TUI_WAIT_SEC))}째 아직 작업 중이야. "
+                "끝나면 답 이어서 보낼게 (같은 일 두 번 안 시킨다).",
+            )
             return
         if TUI_FALLBACK_HEADLESS and not injected:
             answer = run_headless(text)
@@ -2847,9 +3181,14 @@ def typing_off():
     _TYPING_ACTIVE.clear()
 
 
+def typing_should_send():
+    """잡이 살아 있거나, 잡은 닫혔어도 커서 턴이 아직 도는 중이면 「입력 중…」 유지."""
+    return _TYPING_ACTIVE.is_set() or _TUI_JOB_ACTIVE.is_set() or _TUI_TURN_BUSY.is_set()
+
+
 def typing_loop():
     while True:
-        if (_TYPING_ACTIVE.is_set() or _TUI_JOB_ACTIVE.is_set()) and not DRY_RUN:
+        if typing_should_send() and not DRY_RUN:
             send_typing_now()
         time.sleep(4)
 
@@ -2878,12 +3217,24 @@ def main():
     if DRY_RUN:
         return
     drain_pending_updates()
+    # inflight 회수는 턴이 끝날 때까지 기다린다(연장 포함 최대 TUI_WAIT_MAX_SEC). 메인 스레드에서
+    # 돌리면 그동안 getUpdates 가 멈춰 폰에서 /status 조차 안 먹는다 → 스레드로 뺀다.
+    # 회수 중엔 _TUI_JOB_ACTIVE 가 켜져 있어 새 텔레그램 글은 평소처럼 busy-inject(follow-up) 로 간다.
+    threading.Thread(
+        target=_recover_inflight_guarded, name="cub-inflight-recover", daemon=True
+    ).start()
     try:
-        recover_inflight_on_startup()
         harvest_orphaned_finals(newest_transcript_path())
     except Exception as exc:  # noqa: BLE001
         print(f"{LOG_KEY} 기동 회수 실패: {exc}", file=sys.stderr)
     telegram_poller()
+
+
+def _recover_inflight_guarded():
+    try:
+        recover_inflight_on_startup()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{LOG_KEY} inflight 회수 스레드 실패: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
