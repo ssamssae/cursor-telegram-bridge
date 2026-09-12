@@ -7,6 +7,8 @@ The finished answer is sent back through the Telegram Bot API.
 """
 from __future__ import annotations
 
+import fcntl
+import datetime
 import http.client
 import hashlib
 import importlib.util
@@ -22,10 +24,16 @@ import time
 import uuid
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 HOME = os.path.expanduser("~")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+import bridge_flow_progress as _flow_progress  # noqa: E402
+from bridge_public_text import strip_memory_citation  # noqa: E402
+import terminal_turn_mirror as _turn_mirror  # noqa: E402
 
 
 def env(k, default=None):
@@ -92,7 +100,7 @@ TUI_BUSY_INJECT = bool_env("CUB_BUSY_INJECT", True)
 TUI_FALLBACK_HEADLESS = bool_env("CUB_TUI_FALLBACK_HEADLESS", True)
 TUI_MIRROR_LOCAL = bool_env("CUB_TUI_MIRROR_LOCAL", False)
 TUI_MIRROR_LOCAL_INTERVAL = float_env("CUB_TUI_MIRROR_LOCAL_INTERVAL", 5.0)
-TUI_MIRROR_LOCAL_PROMPT_MAX = int_env("CUB_TUI_MIRROR_LOCAL_PROMPT_MAX", 300, minimum=20)
+TUI_MIRROR_LOCAL_PROMPT_MAX = int_env("CUB_TUI_MIRROR_LOCAL_PROMPT_MAX", 2500, minimum=20)
 # T-260906-011: idle 컨텍스트 가드. 상태줄 % 만 읽고 /context 주입은 하지 않는다.
 # PCT=0 이면 끔. 쿨다운 기본 600초. awaiting-human 은 세우지 않는다.
 CUB_CONTEXT_CLEAR_PCT = int_env("CUB_CONTEXT_CLEAR_PCT", 50, minimum=0)
@@ -195,6 +203,7 @@ _DISPATCH_HEAD_RE = re.compile(
     re.MULTILINE,
 )
 _DISPATCH_ROUTE_RE = re.compile(r"^from=\S+\s*\|?\s*task=", re.MULTILINE)
+_DISPATCH_FLEET_RE = re.compile(r"\[APPROVED-FLEET(?:\s+task=|\])")
 
 if not DRY_RUN:
     if not TOKEN_FILE or not os.path.isfile(TOKEN_FILE):
@@ -232,6 +241,8 @@ _TYPING_ACTIVE = threading.Event()
 # typing_loop 가 이걸 보고 「입력 중…」을 유지한다 (2026-09-06 00:2x 사용자 「진행하고있는데
 # 입력중에 표시가안된다」).
 _TUI_TURN_BUSY = threading.Event()
+_COMPOSER_LOCK_HELD = threading.local()
+_TUI_ADMISSION_LOCK = threading.RLock()
 _HEALTH_LOCK = threading.Lock()
 _HARVEST_GEN = 0
 _LAST_FINAL_BODY = ""
@@ -379,6 +390,8 @@ def tui_dead_message():
 
 
 def _tui_send_submit_key():
+    if getattr(_COMPOSER_LOCK_HELD, "auto_clear", False):
+        _context_guard_assert_pending_clear()
     proc = _tmux("send-keys", "-t", TMUX_PANE, TUI_SUBMIT_KEY)
     if getattr(proc, "returncode", 0) not in (0, None):
         print(
@@ -483,6 +496,51 @@ def _tui_compose_is_placeholder(screen):
     if low.startswith("add a follow-up"):
         return True
     if low.startswith("plan, search"):
+        return True
+    return False
+
+
+def _tui_compose_shows_idle_placeholder(screen):
+    """확인된 idle compose. 빈 화면·출처 불명 → 줄은 placeholder 가 아니다.
+
+    `_tui_compose_is_placeholder` 는 제출 Enter 금지용이라 빈 화면도 True 다.
+    context-guard 는 그 계약을 쓰면 안 된다 (T-260907-019).
+    """
+    line = _tui_compose_line(screen)
+    if not line:
+        return False  # unknown compose
+    low = line.lower()
+    if low.startswith("add a follow-up"):
+        return True
+    if low.startswith("plan, search"):
+        return True
+    return False
+
+
+def _tui_pane_shows_guard_busy(screen):
+    """TUI 가 턴·오버레이·중단키를 보여 주면 True. harvest parser 는 건드리지 않는다."""
+    if _tui_repl_shows_turn_started(screen):
+        return True
+    if _tui_pane_shows_steer_overlay(screen):
+        return True
+    if _tui_pane_shows_approval_overlay(screen):
+        return True
+    if _tui_pane_shows_model_picker(screen):
+        return True
+    tail = "\n".join((screen or "").splitlines()[-16:])
+    low = tail.lower()
+    if "ctrl+c" in low or "ctrl-c" in low or "⌃c" in tail or "to stop" in low:
+        return True
+    if re.search(r"(?i)\bgenerating\b", tail) or re.search(r"(?i)\bthinking\b", tail):
+        return True
+    if re.search(r"(?i)\brunning\b", tail) and "run everything" not in low:
+        return True
+    # 2026-09-07 live: `Reading  79.29k tokens` / `Grepping  75.94k tokens`
+    # 은 Waiting 크롬이 아닌데 placeholder 와 같이 떠 있다.
+    if re.search(
+        r"(?i)\b(?:reading|grepping|searching|running|waiting)\b[^\n]*\btokens\b",
+        screen or "",
+    ):
         return True
     return False
 
@@ -1218,6 +1276,261 @@ def handle_context_command(source="telegram"):
     deliver_mesh_event("final", f"Context: {pct}% used")
 
 
+def composer_lock_path():
+    """fleet_dispatch 가 cursor 엔진에 쓰는 기존 composer flock 파일."""
+    override = os.environ.get("CUB_COMPOSER_LOCK")
+    if override:
+        return Path(override).expanduser()
+    return Path(STATE_DIR) / "cursor-composer.lock"
+
+
+@contextmanager
+def composer_lock(*, blocking=True):
+    """같은 프로세스 재진입은 통과. 다른 writer 와는 flock 으로 직렬화."""
+    if getattr(_COMPOSER_LOCK_HELD, "held", False):
+        yield
+        return
+    path = composer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        _COMPOSER_LOCK_HELD.held = True
+        try:
+            yield
+        finally:
+            _COMPOSER_LOCK_HELD.held = False
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _context_guard_inflight_active():
+    try:
+        job = json.loads(Path(TUI_INFLIGHT_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, UnicodeError):
+        return True
+    if not isinstance(job, dict):
+        return True
+    if not job:
+        return False
+    return bool(job.get("path") or job.get("text") or job.get("preview") or job.get("source"))
+
+
+def _context_guard_rows_unfinished(rows):
+    """명시 turn 종료가 없으면 미완료·불명. harvest 의 tail_is_busy 와 다르다.
+
+    tail_is_busy 는 assistant 텍스트면 끝난 것으로 본다. 가드는 turn_ended 가
+    있어야 idle 로 확정한다. 중간 텍스트·tool_use·user 대기는 모두 보류.
+    """
+    if not rows:
+        return True
+    for last in reversed(rows):
+        if last.get("type") == "turn_ended":
+            return last.get("status") != "success"
+        if last.get("role") in {"assistant", "user"}:
+            return True  # assistant text without turn_ended is unknown
+    return True
+
+
+def _context_guard_mtime_newest_transcript():
+    """harvest pin 을 무시하고 mtime 최신 jsonl. newest_transcript_path 는 bound 를 선호한다."""
+    paths = list_transcript_paths()
+    return paths[-1] if paths else None
+
+
+def _context_guard_fleet_context_dir():
+    override = os.environ.get("CUB_FLEET_CONTEXT_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(STATE_DIR) / "dispatch-context"
+
+
+def _context_guard_fleet_blocks_clear():
+    """The fleet carrier persists submitting/submitted before releasing flock.
+
+    That existing record bridges the gap before Cursor renders the new turn.
+    Only a successfully ended transcript containing this submission releases it.
+    """
+    folder = _context_guard_fleet_context_dir()
+    try:
+        if not folder.exists():
+            return False
+        records = []
+        for path in folder.glob("*.json"):
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                return True
+            if rec.get("target") == {"node": NODE_KEY, "engine": "cursor"}:
+                records.append((path.stat().st_mtime_ns, rec))
+        if not records:
+            return False
+        _, rec = max(records, key=lambda item: item[0])
+        task_id = str(rec.get("task_id") or "")
+        if rec.get("status") != "submitted" or not re.fullmatch(r"T-\d{6}-\d{2,}", task_id):
+            return True
+        state = rec.get("state")
+        if not isinstance(state, dict) or not isinstance(state.get("dispatched"), list):
+            return True
+        starts = [entry.get("at") for entry in state["dispatched"] if isinstance(entry, dict)
+                  and entry.get("task_id") == task_id and entry.get("worker") == f"{NODE_KEY}:cursor"]
+        if len(starts) != 1 or not isinstance(starts[0], str):
+            return True
+        started = datetime.datetime.fromisoformat(starts[0].replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            return True
+        # The immutable sender timestamp precedes paste. The final atomic
+        # submitted rewrite may occur after a fast turn has already ended.
+        submitted_ns = int(started.timestamp() * 1_000_000_000)
+        marker = f"[APPROVED-FLEET task={task_id} "
+        for path in reversed(list_transcript_paths()):
+            before = path.stat()
+            if before.st_mtime_ns < submitted_ns:
+                continue
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            after = path.stat()
+            if ((before.st_mtime_ns, before.st_size, before.st_ino)
+                    != (after.st_mtime_ns, after.st_size, after.st_ino)):
+                return True
+            if any(not isinstance(row, dict) for row in rows):
+                return True
+            if any(row.get("role") == "user" and any(marker in text for text in _content_texts(row)) for row in rows):
+                return _context_guard_rows_unfinished(rows)
+        return True
+    except (OSError, ValueError, UnicodeError):
+        return True
+
+
+def _context_guard_transcript_blocks_clear():
+    """활성 일기장이 미종료·불명이거나 pin 과 live 가 갈리면 clear 금지."""
+    if _context_guard_inflight_active():
+        return True
+    if _context_guard_fleet_blocks_clear():
+        return True
+    newest = _context_guard_mtime_newest_transcript()
+    try:
+        state = json.loads(Path(CURSOR_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        state = {}
+    except (OSError, ValueError, UnicodeError):
+        return True
+    if not isinstance(state, dict):
+        return True
+    bound_s = str(state.get("path") or "")
+    bound = Path(bound_s) if bound_s else None
+    seen = set()
+    candidates = []
+    if newest:
+        candidates.append(newest)
+    if bound is not None:
+        candidates.append(bound)
+    if not candidates:
+        return True
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not path or not Path(path).is_file():
+            return True
+        # Harvest tolerates partial JSONL; destructive auto-clear must not.
+        try:
+            before = Path(path).stat()
+            rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            after = Path(path).stat()
+            if (before.st_mtime_ns, before.st_size, before.st_ino) != (after.st_mtime_ns, after.st_size, after.st_ino):
+                return True
+            if any(not isinstance(row, dict) for row in rows):
+                return True
+        except (OSError, ValueError, UnicodeError):
+            return True
+        if _context_guard_rows_unfinished(rows):
+            return True
+    return False
+
+
+def _context_guard_screen_allows_clear(screen):
+    if not _tui_compose_shows_idle_placeholder(screen):
+        return False
+    if _tui_pane_shows_guard_busy(screen):
+        return False
+    if _tui_pane_shows_approval_overlay(screen) or _tui_pane_shows_model_picker(screen):
+        return False
+    return True
+
+
+def _context_guard_footer_percent(screen):
+    lines = (screen or "").splitlines()
+    compose = [i for i, line in enumerate(lines) if line.lstrip().startswith("→")]
+    return parse_tui_context_percent("\n".join(lines[compose[-1]:])) if compose else None
+
+
+def _context_guard_ready_to_clear(screen=None):
+    """락 안에서 새 capture + busy/queue/inflight/transcript 를 다시 본다. 불명이면 None."""
+    if is_awaiting_human() or _TUI_RESET.is_set() or _TUI_JOB_ACTIVE.is_set():
+        return None
+    if _TUI_TURN_BUSY.is_set():
+        return None
+    if not JOBS.empty():
+        return None
+    if _context_guard_inflight_active():
+        return None
+    screen = _tui_capture_pane() if screen is None else screen
+    if _TUI_JOB_ACTIVE.is_set() or _TUI_TURN_BUSY.is_set() or not JOBS.empty():
+        return None
+    if _context_guard_inflight_active():
+        return None
+    if not _context_guard_screen_allows_clear(screen):
+        return None
+    if _context_guard_transcript_blocks_clear():
+        return None
+    raw = _context_guard_footer_percent(screen)
+    if raw is None:
+        return None
+    try:
+        used = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if used < CUB_CONTEXT_CLEAR_PCT:
+        return None
+    if not tui_session_alive():
+        return None
+    return screen
+
+
+def _context_guard_assert_pending_clear():
+    """Recheck immediately before Enter, including retries of our own /clear."""
+    screen = _tui_capture_pane()
+    compose = _tui_compose_line(screen)
+    owns_clear = re.fullmatch(r"/clear(?:\s{2,}Start a new chat.*)?", compose)
+    if (not owns_clear or _tui_pane_shows_guard_busy(screen)
+            or is_awaiting_human() or _TUI_RESET.is_set()
+            or _TUI_JOB_ACTIVE.is_set() or _TUI_TURN_BUSY.is_set()
+            or not JOBS.empty() or _context_guard_transcript_blocks_clear()):
+        raise RuntimeError("context-guard: state changed before submit")
+
+
+def _context_guard_discard_own_clear():
+    """Rollback only our exact unsubmitted /clear, while the composer lock is held."""
+    if not getattr(_COMPOSER_LOCK_HELD, "auto_clear", False):
+        return False
+    screen = _tui_capture_pane()
+    compose = _tui_compose_line(screen)
+    if (not re.fullmatch(r"/clear(?:\s{2,}Start a new chat.*)?", compose)
+            or _TUI_JOB_ACTIVE.is_set() or not JOBS.empty()
+            or _context_guard_inflight_active()
+            or _tui_pane_shows_approval_overlay(screen)):
+        return False
+    _tmux("send-keys", "-t", TMUX_PANE, "Escape")
+    time.sleep(TUI_SUBMIT_DELAY)
+    screen = _tui_capture_pane()
+    if _tui_compose_line(screen) != "/clear":
+        return False
+    _tui_erase_compose(len("/clear"))
+    print(f"{LOG_KEY} cancelled unsubmitted automatic /clear", flush=True)
+    return True
+
+
 def handle_tui_reset(source="telegram"):
     """TUI /clear|/new — 브릿지 대기·회수·확인버튼을 먼저 비우고 Cursor 에 /clear 를 넣는다.
 
@@ -1225,9 +1538,45 @@ def handle_tui_reset(source="telegram"):
     source=context-guard (T-260906-011) 는 awaiting-human 을 세우지 않는다.
     세우면 이후 오케 directive 가 「/clear 이후 기계 주입 폐기」로 버려진다.
     기존 awaiting-human 파일도 건드리지 않는다 (clear_awaiting_human 호출 금지).
+    context-guard 는 queue/inflight/harvest 를 지우기 전에 락 안 재검사로 외부 턴을 보존한다
+    (T-260907-019). 사용자 명시 /clear|/new 는 기존처럼 대기잡을 비운다.
     """
+    if source == "context-guard":
+        if not _TUI_ADMISSION_LOCK.acquire(blocking=False):
+            return False
+        try:
+            with composer_lock(blocking=False):
+                return _handle_tui_reset_locked(source)
+        except (OSError, ValueError, UnicodeError, RuntimeError, subprocess.SubprocessError) as exc:
+            print(f"{LOG_KEY} context-guard skipped: {type(exc).__name__}", file=sys.stderr)
+            return False
+        finally:
+            _TUI_ADMISSION_LOCK.release()
+    with _TUI_ADMISSION_LOCK, composer_lock():
+        return _handle_tui_reset_locked(source)
+
+
+def _handle_tui_reset_locked(source):
     global _HARVEST_GEN
     auto = source == "context-guard"
+    if auto and _context_guard_ready_to_clear() is None:
+        print(f"{LOG_KEY} context-guard 재검사 — busy/불명이라 /clear 안 함", file=sys.stderr)
+        return False
+    if auto:
+        # Admission and composer locks keep bridge/fleet writers outside this
+        # window. Never set the cancellation flag or discard queued work.
+        _COMPOSER_LOCK_HELD.auto_clear = True
+        try:
+            _tui_paste("/clear", interrupt=False)
+        except Exception:
+            _context_guard_discard_own_clear()
+            raise
+        finally:
+            _COMPOSER_LOCK_HELD.auto_clear = False
+        if not _TUI_JOB_ACTIVE.is_set() and JOBS.empty() and not _context_guard_inflight_active():
+            reset_cursor_harvest_state()
+            forget_suggested_replies()
+        return True
     _TUI_RESET.set()
     _HARVEST_GEN += 1
     dropped = drain_pending_jobs()
@@ -1260,6 +1609,8 @@ def maybe_auto_clear_idle_context(now=None, screen=None):
 
     판정은 idle 에서만: 잡·턴 busy·대기 큐·compose 입력·approval/model picker 없음.
     성공 시에만 쿨다운을 열고 report 1줄을 보낸다. T-260906-011.
+    T-260907-019: 자동 clear 는 새 capture·TUI 증거·활성 일기장 종료 증거·composer lock
+    재검사를 통과한 뒤에만 수행. 불명이면 세션을 보존한다.
     """
     global _CONTEXT_GUARD_LAST_AT
     if CUB_CONTEXT_CLEAR_PCT <= 0:
@@ -1272,12 +1623,17 @@ def maybe_auto_clear_idle_context(now=None, screen=None):
     if not JOBS.empty():
         return False
     if screen is None:
-        screen = _tui_capture_pane()
-    if not _tui_compose_is_placeholder(screen):
+        try:
+            screen = _tui_capture_pane()
+        except (OSError, subprocess.SubprocessError):
+            return False
+    if not _tui_compose_shows_idle_placeholder(screen):
         return False
     if _tui_pane_shows_approval_overlay(screen) or _tui_pane_shows_model_picker(screen):
         return False
-    raw = parse_tui_context_percent(screen)
+    if _tui_pane_shows_guard_busy(screen):
+        return False
+    raw = _context_guard_footer_percent(screen)
     if raw is None:
         return False
     try:
@@ -1288,12 +1644,14 @@ def maybe_auto_clear_idle_context(now=None, screen=None):
         return False
     if not tui_session_alive():
         return False
+    # A failed automatic attempt also gets a cooldown; never keep re-pasting it.
+    _CONTEXT_GUARD_LAST_AT = now
     if not handle_tui_reset(source="context-guard"):
         return False
-    _CONTEXT_GUARD_LAST_AT = now
     deliver_mesh_event(
         "report",
-        f"컨텍스트 {raw}% — 자동 /clear 했어. 진행 중 작업은 tasks.md 로 재개.",
+        f"컨텍스트 {raw}% — 자동 /clear 했어. 이 브릿지는 작업을 자동 재개하지 않아. "
+        "필요하면 작업 체크포인트에서 이어서 진행해.",
     )
     print(f"{LOG_KEY} context-guard {raw}% → /clear", file=sys.stderr)
     return True
@@ -1319,6 +1677,11 @@ def strip_suggested_tail_instruction(text):
 
 
 def _tui_paste(prompt, *, interrupt=False):
+    with composer_lock():
+        _tui_paste_unlocked(prompt, interrupt=interrupt)
+
+
+def _tui_paste_unlocked(prompt, *, interrupt=False):
     original = (prompt or "").rstrip("\n")
     payload = with_suggested_tail_instruction(original)
     payload = payload.rstrip("\n")
@@ -1331,6 +1694,9 @@ def _tui_paste(prompt, *, interrupt=False):
     del interrupt
     path = newest_transcript_path()
     screen = _tui_capture_pane()
+    if getattr(_COMPOSER_LOCK_HELD, "auto_clear", False):
+        if _context_guard_ready_to_clear(screen=screen) is None:
+            raise RuntimeError("context-guard: state changed before paste")
     if _tui_pane_shows_approval_overlay(screen):
         raise RuntimeError("TUI 승인 대기 중 — 키 주입 금지")
     if _tui_is_native_slash_prompt(payload):
@@ -1342,6 +1708,9 @@ def _tui_paste(prompt, *, interrupt=False):
     else:
         print(f"{LOG_KEY} Waiting 크롬 — Space 생략", file=sys.stderr)
     _tmux("load-buffer", "-", input_text=payload)
+    if getattr(_COMPOSER_LOCK_HELD, "auto_clear", False):
+        if _context_guard_ready_to_clear() is None:
+            raise RuntimeError("context-guard: state changed before paste-buffer")
     _tmux("paste-buffer", "-p", "-t", TMUX_PANE)
     time.sleep(TUI_SUBMIT_DELAY)
     _tui_send_submit_key()
@@ -1387,15 +1756,203 @@ def list_transcript_paths(root=None):
     return [p for p in _all_transcript_paths(root) if str(p) not in skip]
 
 
+_PANE_OWNED_CACHE = {"at": 0.0, "pid": None, "ids": None}
+_CHAT_STORE_RE = re.compile(r"/\.cursor/chats/[^/]+/([^/]+)/store\.db")
+_DEFAULT_TRANSCRIPT_ROOT = os.path.join(HOME, ".cursor", "projects")
+
+
+def _transcript_session_id(path):
+    return Path(path).parent.name if path else ""
+
+
+def _tmux_pane_pid():
+    proc = _tmux("display-message", "-p", "-t", TMUX_PANE, "#{pane_pid}")
+    raw = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def _direct_child_pids(pid):
+    """tmux pane PID의 직계 자식만. Cursor agent가 store.db를 연다."""
+    if not pid:
+        return []
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-P", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [int(x) for x in (proc.stdout or "").split() if x.strip().isdigit()]
+
+
+def _lsof_chat_ids_for_pid(pid):
+    """한 PID의 open store.db. 실패하면 None(불명)."""
+    if not pid:
+        return None
+    try:
+        proc = subprocess.run(
+            ["lsof", "-p", str(int(pid)), "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+    ids = set()
+    for line in (proc.stdout or "").splitlines():
+        if not line.startswith("n"):
+            continue
+        match = _CHAT_STORE_RE.search(line)
+        if match:
+            ids.add(match.group(1))
+    return ids
+
+
+def _pane_owned_chat_ids():
+    """명시 소유. 불명이면 None. 빈 set은 '이 pane이 연 chat store가 없음'.
+
+    pane PID lsof만 보면 Cursor agent 자식이 연 store를 놓쳐 로컬미러가 0이 된다.
+    """
+    override = os.environ.get("CUB_OWNED_CHAT_IDS")
+    if override is not None:
+        if not override.strip():
+            return None
+        if override.strip() in {"-", "."}:
+            return set()
+        return {part.strip() for part in override.split(",") if part.strip()}
+    root = Path(os.environ.get("CUB_TRANSCRIPT_ROOT") or TRANSCRIPT_ROOT)
+    try:
+        if root.resolve() != Path(_DEFAULT_TRANSCRIPT_ROOT).resolve():
+            return None
+    except OSError:
+        return None
+    now = time.time()
+    pid = _tmux_pane_pid()
+    cache = _PANE_OWNED_CACHE
+    if (
+        cache["pid"] == pid
+        and cache["ids"] is not None
+        and (now - float(cache["at"] or 0)) < TUI_MIRROR_LOCAL_INTERVAL
+    ):
+        return cache["ids"]
+    ids = _lsof_chat_ids_for_pid(pid)
+    if ids is not None and not ids:
+        child_ids = set()
+        for cpid in _direct_child_pids(pid):
+            more = _lsof_chat_ids_for_pid(cpid)
+            if more:
+                child_ids |= more
+        if child_ids:
+            ids = child_ids
+    _PANE_OWNED_CACHE.update({"at": now, "pid": pid, "ids": ids})
+    return ids
+
+
+def _transcript_birth_ts(path):
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return 0.0
+    return float(getattr(st, "st_birthtime", st.st_ctime) or 0.0)
+
+
+def _process_started_at():
+    try:
+        return float(_HEALTH.get("started_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _handled_entry(rec, path):
+    hp = rec.get("handled_paths") if isinstance(rec, dict) else None
+    if not isinstance(hp, dict):
+        return None
+    entry = hp.get(str(path))
+    return entry if isinstance(entry, dict) else None
+
+
+def _transcript_is_runtime_new_session(path, rec):
+    """이 프로세스 시작 이후에 생긴 경로의 최초 처리. 재시작 전 파일·이미 처리한 경로는 제외."""
+    if not path or not rec:
+        return False
+    # A new file can contain imported history; require ownership by the live pane.
+    if _transcript_session_id(path) not in (_pane_owned_chat_ids() or set()):
+        return False
+    if _handled_entry(rec, path):
+        return False
+    if rec.get("finals_sent") is None:
+        return False
+    prev = str(rec.get("path") or "")
+    if not prev or prev == str(path):
+        return False
+    started = _process_started_at()
+    birth = _transcript_birth_ts(path)
+    if started and birth <= started:
+        return False
+    return True
+
+
+def _owned_transcript_paths(ids, root=None):
+    """owned chat id만 glob. 전역 jsonl을 열어 usable을 만들지 않는다."""
+    base = Path(root or TRANSCRIPT_ROOT)
+    if not base.is_dir() or not ids:
+        return []
+    skip = load_headless_transcripts()
+    out = []
+    for sid in ids:
+        if not sid or not re.fullmatch(r"[\w.-]+", sid):
+            continue
+        for path in base.glob(f"*/agent-transcripts/{sid}/*.jsonl"):
+            if str(path) in skip:
+                continue
+            try:
+                out.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+    out.sort(key=lambda item: item[0])
+    return [path for _, path in out]
+
+
 def newest_transcript_path(root=None):
-    paths = list_transcript_paths(root)
+    """대상 pane이 연 chat store로 후보를 제한한다. 낡은 bound에 묶이면 터미널 답이 유실된다.
+
+    owned is None: 불명 — bound만 읽고 전역 최신 mtime으로 다른 세션을 고르지 않는다.
+    owned == set(): 이 pane이 연 chat 없음 — 남의 bound를 반환하지 않는다.
+    """
     rec = load_cursor_state()
     bound_s = str(rec.get("path") or "")
-    if bound_s:
-        bound = Path(bound_s)
-        if bound in paths and not transcript_is_aborted_only(read_transcript_rows(bound)):
+    bound = Path(bound_s) if bound_s else None
+    skip = load_headless_transcripts()
+    owned = _pane_owned_chat_ids()
+    if owned is not None:
+        if not owned:
+            return None
+        candidates = _owned_transcript_paths(owned, root)
+        usable = [
+            path
+            for path in candidates
+            if not transcript_is_aborted_only(read_transcript_rows(path))
+        ]
+        if usable:
+            return usable[-1]
+        return None
+    if bound and bound.is_file() and str(bound) not in skip:
+        if not transcript_is_aborted_only(read_transcript_rows(bound)):
             return bound
-    return paths[-1] if paths else None
+        return None
+    paths = list_transcript_paths(root)
+    if len(paths) == 1 and str(paths[0]) not in skip:
+        if not transcript_is_aborted_only(read_transcript_rows(paths[0])):
+            return paths[0]
+    return None
 
 
 def read_transcript_rows(path):
@@ -1440,6 +1997,57 @@ def row_has_tool_use(row):
     if isinstance(content, list):
         return any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
     return False
+
+
+def cursor_flow_enabled() -> bool:
+    configured = os.environ.get(CUB_FLOW_MIRROR_ENV)
+    if configured is not None and configured.strip():
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return os.path.exists(CUB_FLOW_MIRROR_FLAG)
+
+
+def cursor_flow_detail_enabled() -> bool:
+    return _flow_progress.detail_enabled(CUB_FLOW_MIRROR_DETAIL_ENV, CUB_FLOW_MIRROR_DETAIL_FLAG)
+
+
+def _tool_block_stage_detail(block) -> str:
+    inp = (block or {}).get("input") or (block or {}).get("arguments") or {}
+    if isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except Exception:
+            return ""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("command", "cmd", "shell", "script"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def last_tool_flow_line(rows) -> str:
+    for row in reversed(rows or []):
+        msg = row.get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                name = str(block.get("name") or "")
+                detail = _tool_block_stage_detail(block)
+                if cursor_flow_detail_enabled():
+                    return name
+                return _flow_progress.classify_flow_stage(name=name, detail=detail)
+    return _flow_progress.FLOW_STAGE_WORK if rows else ""
+
+
+def _cursor_flow_close(status: str, started: float, last_stage: str) -> None:
+    if not cursor_flow_enabled() or not last_stage:
+        return
+    label = _flow_progress.flow_done_label(status)
+    elapsed = _flow_progress.format_flow_elapsed(time.time() - started)
+    deliver_mesh_event("report", f"{label} · 소요 {elapsed}")
 
 
 def assistant_texts(rows):
@@ -1574,7 +2182,7 @@ def cursor_file_baseline(path):
         return 0
 
 
-def save_cursor(path, rows, last_final=None, finals_sent=None, delivered_final=None):
+def save_cursor(path, rows, last_final=None, finals_sent=None, delivered_final=None, last_observe_at=None):
     rec = load_cursor_state()
     path_changed = rec.get("path") != str(path)
     rec["path"] = str(path)
@@ -1587,6 +2195,14 @@ def save_cursor(path, rows, last_final=None, finals_sent=None, delivered_final=N
         rec["finals_sent"] = int(finals_sent)
     if delivered_final is not None:
         rec["delivered_final"] = delivered_final
+    rec["last_observe_at"] = float(time.time() if last_observe_at is None else last_observe_at)
+    if finals_sent is not None:
+        hp = rec.get("handled_paths") if isinstance(rec.get("handled_paths"), dict) else {}
+        hp[str(path)] = {
+            "finals_sent": int(finals_sent),
+            "last_final": str(rec.get("last_final") or ""),
+        }
+        rec["handled_paths"] = hp
     _write(CURSOR_FILE, json.dumps(rec, ensure_ascii=False))
 
 
@@ -1623,12 +2239,13 @@ def is_telegram_origin_prompt(question):
 
 
 def is_dispatch_prompt(question):
-    """오케/함대 배차 본문인가. 문자열 추측이 아니라 운반체 표식 3종."""
+    """오케/함대 배차 본문인가. 문자열 추측이 아니라 운반체 표식."""
     raw = question or ""
     return bool(
         _DISPATCH_CARRIER_RE.search(raw)
         or _DISPATCH_HEAD_RE.search(raw)
         or _DISPATCH_ROUTE_RE.search(raw)
+        or _DISPATCH_FLEET_RE.search(raw)
     )
 
 
@@ -1691,6 +2308,20 @@ def _harvest_orphaned_finals_locked(path):
             # /clear 가 남긴 aborted-only 핀 → 같은 세션의 새 일기장. 새 일기장은 새 답만 있다.
             already = 0
             last = ""
+        elif _transcript_is_runtime_new_session(path, rec):
+            # 답 개수는 과거/신규 증거가 아니다. 라벨 있는 전달은 local mirror가 한다.
+            save_cursor(path, len(rows), last_final="", finals_sent=0)
+            if TUI_MIRROR_LOCAL:
+                return 0
+            already = 0
+            last = ""
+        elif _handled_entry(rec, path):
+            entry = _handled_entry(rec, path)
+            try:
+                already = int(entry.get("finals_sent") or 0)
+            except (TypeError, ValueError):
+                already = 0
+            last = str(entry.get("last_final") or "")
         else:
             save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(texts))
             return 0
@@ -1772,7 +2403,7 @@ def phone_facing_answer(text, max_lines=None):
     유지해 긴 보고의 구조가 폰에서도 읽히게 한다.
     """
     limit = PHONE_FACING_MAX_LINES if max_lines is None else max(0, int(max_lines))
-    raw = str(text or "")
+    raw = strip_memory_citation(str(text or ""))
     if not raw.strip():
         return ""
     cleaned = _PHONE_MARKER_RE.sub("", raw)
@@ -1811,15 +2442,11 @@ def _is_phone_agent_meta_line(s):
 
 
 def _mirror_prompt_body(question):
-    # 터미널 질문 미러는 머리글 2줄만 — 답 본문(무제한)과 다른 축.
+    # T-260910-012: 사람 터미널은 기존 라벨, 배차는 보낸 지시. 터미널 라벨로 배차를
+    # 에코하지 않는다(T-260910-006). 시크릿은 가린다. 도구 원로그는 여기 안 탄다.
     if is_dispatch_prompt(question):
-        return ""
-    head = phone_facing_answer(question or "", max_lines=2)
-    if not head:
-        return ""
-    if len(head) > TUI_MIRROR_LOCAL_PROMPT_MAX:
-        head = head[:TUI_MIRROR_LOCAL_PROMPT_MAX] + " …"
-    return f"터미널에서 물어본 것 — {head}"
+        return _turn_mirror.format_sent_directive(question or "")
+    return _turn_mirror.format_terminal_query(question or "")
 
 
 def mirror_local_tui_turns():
@@ -1837,6 +2464,16 @@ def mirror_local_tui_turns():
         _TUI_TURN_BUSY.clear()
         return 0
     with _HARVEST_LOCK:
+        if _TUI_JOB_ACTIVE.is_set():
+            return 0
+        job = _tui_inflight_load()
+        if job and job.get("text"):
+            path, _, rebound = _maybe_rebind_active_transcript(
+                path, int(job.get("baseline") or 0),
+                job.get("prior_path") or job.get("path"), job["text"],
+            )
+            if rebound:
+                print(f"{LOG_KEY} pending reply rebound to {path}", flush=True)
         rows = read_transcript_rows(path)
         if tail_is_busy(rows):
             _TUI_TURN_BUSY.set()
@@ -1844,18 +2481,30 @@ def mirror_local_tui_turns():
         _TUI_TURN_BUSY.clear()
         pairs = assistant_final_pairs(rows)
         rec = load_cursor_state()
-        if rec.get("path") != str(path) or rec.get("finals_sent") is None:
+        runtime_new = _transcript_is_runtime_new_session(path, rec)
+        handled = _handled_entry(rec, path)
+        if rec.get("path") == str(path) and rec.get("finals_sent") is not None:
+            try:
+                already = int(rec.get("finals_sent") or 0)
+            except (TypeError, ValueError):
+                already = 0
+            last = str(rec.get("last_final") or "")
+        elif runtime_new:
+            already = 0
+            last = ""
+        elif handled:
+            try:
+                already = int(handled.get("finals_sent") or 0)
+            except (TypeError, ValueError):
+                already = 0
+            last = str(handled.get("last_final") or "")
+        else:
             save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(pairs))
             return 0
-        try:
-            already = int(rec.get("finals_sent") or 0)
-        except (TypeError, ValueError):
-            already = 0
         if already > len(pairs):
             already = len(pairs)
-        last = str(rec.get("last_final") or "")
         sent = 0
-        for question, answer in pairs[already:]:
+        for pair_index, (question, answer) in enumerate(pairs[already:], start=already):
             if not answer or answer == last:
                 continue
             if is_telegram_origin_prompt(question):
@@ -1865,16 +2514,21 @@ def mirror_local_tui_turns():
                 if answer == str(rec.get("delivered_final") or ""):
                     last = answer
                     continue
-                if _mesh_delivery_sent(deliver_cursor_answer(answer)):
-                    rec["delivered_final"] = answer
-                    save_cursor(path, len(rows), delivered_final=answer)
+                if not _mesh_delivery_sent(deliver_cursor_answer(answer)):
+                    return sent
+                rec["delivered_final"] = answer
+                save_cursor(path, len(rows), delivered_final=answer,
+                            last_final=answer, finals_sent=pair_index + 1)
                 last = answer
                 sent += 1
                 continue
             prompt = _mirror_prompt_body(question)
             if prompt:
                 deliver_mesh_event("report", prompt)
-            deliver_cursor_answer(answer)
+            if not _mesh_delivery_sent(deliver_cursor_answer(answer)):
+                return sent
+            save_cursor(path, len(rows), delivered_final=answer,
+                        last_final=answer, finals_sent=pair_index + 1)
             last = answer
             sent += 1
         save_cursor(path, len(rows), last_final=last, finals_sent=len(pairs))
@@ -1907,10 +2561,17 @@ def _maybe_rebind_active_transcript(path, baseline, prior_path, pasted_text):
         return path, baseline, False
     if not _transcript_has_pasted_user(active, token):
         return path, baseline, False
-    rows_at_bind = len(read_transcript_rows(active))
+    active_rows = read_transcript_rows(active)
+    rows_at_bind = len(active_rows)
     if _transcript_mtime_fresh_for_job(active):
-        bind_cursor_if_needed(active, 0)
-        new_baseline = 0
+        new_baseline = next((
+            index for index in range(len(active_rows) - 1, -1, -1)
+            if active_rows[index].get("role") == "user"
+            and token in (user_query_text(active_rows[index]) or "\n".join(_content_texts(active_rows[index])).strip())
+        ), None)
+        if new_baseline is None:  # transcript changed between the matching reads
+            return path, baseline, False
+        bind_cursor_if_needed(active, new_baseline)
     else:
         bind_cursor_if_needed(active, rows_at_bind)
         new_baseline = rows_at_bind
@@ -1951,12 +2612,16 @@ def wait_for_final(path, baseline, deadline, gen=None, *, pasted_text=None, prio
     last_len = baseline
     last_change = time.time()
     last_answer = ""
+    last_stage = ""
+    started = time.time()
     hard_deadline = deadline - TUI_WAIT_SEC + max(TUI_WAIT_MAX_SEC, TUI_WAIT_SEC)
     extended = False
     while True:
         if _TUI_RESET.is_set():
+            _cursor_flow_close("interrupt", started, last_stage)
             return "", path
         if gen is not None and gen != _HARVEST_GEN:
+            _cursor_flow_close("cancelled", started, last_stage)
             return "", path
         path, baseline, rebound = _maybe_rebind_active_transcript(
             path, baseline, prior_path, pasted_text
@@ -1965,17 +2630,26 @@ def wait_for_final(path, baseline, deadline, gen=None, *, pasted_text=None, prio
             last_len = baseline
             last_change = time.time()
             last_answer = ""
+            last_stage = ""
         rows = read_transcript_rows(path)
+        turn_rows = rows[int(baseline or 0):]
         if len(rows) != last_len:
             last_len = len(rows)
             last_change = time.time()
             last_answer = harvest_new_assistant(path, baseline)
+            if cursor_flow_enabled():
+                stage = last_tool_flow_line(turn_rows)
+                if stage and stage != last_stage:
+                    last_stage = stage
+                    deliver_mesh_event("report", stage)
         if last_answer and not tail_is_busy(rows):
             if turn_has_ended(rows) or (time.time() - last_change) >= TUI_IDLE_SEC:
+                _cursor_flow_close("sent", started, last_stage)
                 return last_answer, path
         now = time.time()
         if now >= deadline:
             if not turn_still_running(rows, last_change, now, hard_deadline):
+                _cursor_flow_close("timeout", started, last_stage)
                 return last_answer, path
             if not extended:
                 extended = True
@@ -2343,11 +3017,36 @@ def _write_model_store(store):
     os.replace(tmp, MODEL_STORE_FILE)
 
 
-def model_menu_markup(current=""):
+def model_menu_markup(current="", page=0):
+    """모델 버튼을 2열·페이지로 나눈다. 한 줄 스택은 텔레그램이 아래를 자른다."""
+    names = list(MODEL_MENU)
+    size = max(1, int(MODEL_PAGE_SIZE))
+    cols = max(1, int(MODEL_MENU_COLUMNS))
+    pages = max(1, (len(names) + size - 1) // size) if names else 1
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+    page = page % pages
+    chunk = names[page * size : page * size + size]
     rows = []
-    for name in MODEL_MENU:
+    row = []
+    for name in chunk:
         mark = "✅ " if current and name.lower() == current.lower() else ""
-        rows.append([{"text": f"{mark}{name}", "callback_data": f"{MODEL_CALLBACK_PREFIX}:{name}"[:64]}])
+        row.append({"text": f"{mark}{name}", "callback_data": f"{MODEL_CALLBACK_PREFIX}:{name}"[:64]})
+        if len(row) >= cols:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if pages > 1:
+        rows.append(
+            [
+                {"text": "◀", "callback_data": f"{MODEL_PAGE_CALLBACK}:{(page - 1) % pages}"},
+                {"text": f"{page + 1}/{pages}", "callback_data": f"{MODEL_PAGE_CALLBACK}:{page}"},
+                {"text": "▶", "callback_data": f"{MODEL_PAGE_CALLBACK}:{(page + 1) % pages}"},
+            ]
+        )
     rows.append([{"text": "✖ 닫기", "callback_data": MODEL_CLOSE_CALLBACK}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
@@ -2400,13 +3099,35 @@ def surface_tui_model_picker():
     return 1
 
 
-def handle_model_callback(data, answer):
+def handle_model_callback(data, answer, message=None):
     if data == MODEL_CLOSE_CALLBACK:
         if tui_session_alive() and _tui_pane_shows_model_picker(_tui_capture_pane()):
             _tui_close_model_picker()
             answer("선택창 닫았어")
         else:
             answer()
+        return
+    if data.startswith(f"{MODEL_PAGE_CALLBACK}:"):
+        raw = data[len(MODEL_PAGE_CALLBACK) + 1 :]
+        try:
+            page = int(raw)
+        except ValueError:
+            answer()
+            return
+        current = _tui_current_model() if tui_session_alive() else ""
+        mid = message.get("message_id") if isinstance(message, dict) else None
+        if mid:
+            try:
+                tg(
+                    "editMessageReplyMarkup",
+                    timeout=10,
+                    chat_id=CHAT_ID,
+                    message_id=int(mid),
+                    reply_markup=model_menu_markup(current, page=page),
+                )
+            except (TypeError, ValueError, Exception) as exc:  # noqa: BLE001
+                print(f"{LOG_KEY} model page edit 실패: {exc}", file=sys.stderr)
+        answer()
         return
     name = data[len(MODEL_CALLBACK_PREFIX) + 1 :].strip()
     allowed = {m.lower() for m in MODEL_MENU}
@@ -2545,7 +3266,7 @@ def handle_telegram_callback(callback):
         return
     data = str(cb.get("data") or "")
     if data.startswith(f"{MODEL_CALLBACK_PREFIX}:"):
-        handle_model_callback(data, answer)
+        handle_model_callback(data, answer, message)
         return
     approval_prefix = f"{APPROVAL_CALLBACK_PREFIX}:"
     if data.startswith(approval_prefix):
@@ -2749,15 +3470,16 @@ def maybe_busy_inject_telegram(text, source):
 
 
 def process_job(source, text, meta=None):
-    if _TUI_RESET.is_set():
-        return
-    if is_awaiting_human() and source != "telegram":
-        print(f"{LOG_KEY} /clear 이후 기계 잡 폐기 source={source}", file=sys.stderr)
-        return
-    health_mark(last_job_started_at=time.time())
-    if source == "telegram":
-        remember_telegram_origin_prompt(text)
-    _TUI_JOB_ACTIVE.set()
+    with _TUI_ADMISSION_LOCK:
+        if _TUI_RESET.is_set():
+            return
+        if is_awaiting_human() and source != "telegram":
+            print(f"{LOG_KEY} /clear 이후 기계 잡 폐기 source={source}", file=sys.stderr)
+            return
+        health_mark(last_job_started_at=time.time())
+        if source == "telegram":
+            remember_telegram_origin_prompt(text)
+        _TUI_JOB_ACTIVE.set()
     try:
         injected = isinstance(meta, dict) and meta.get("kind") == "injected_harvest"
         path = Path(meta["path"]) if injected and meta.get("path") else newest_transcript_path()
@@ -2882,6 +3604,11 @@ def is_status_command(text):
 
 
 def handle_message_text(text, source="telegram", meta=None):
+    with _TUI_ADMISSION_LOCK:
+        return _handle_message_text_locked(text, source, meta)
+
+
+def _handle_message_text_locked(text, source="telegram", meta=None):
     global _HARVEST_GEN
     token = (text or "").strip()
     if token.lower() in ("/start", "/ping"):
