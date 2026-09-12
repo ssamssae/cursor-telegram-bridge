@@ -1881,23 +1881,19 @@ def _handled_entry(rec, path):
 
 def _transcript_is_runtime_new_session(path, rec):
     """이 프로세스 시작 이후에 생긴 경로의 최초 처리. 재시작 전 파일·이미 처리한 경로는 제외."""
-    if not path or not rec:
+    if not path:
         return False
     # A new file can contain imported history; require ownership by the live pane.
     if _transcript_session_id(path) not in (_pane_owned_chat_ids() or set()):
         return False
     if _handled_entry(rec, path):
         return False
-    if rec.get("finals_sent") is None:
-        return False
     prev = str(rec.get("path") or "")
-    if not prev or prev == str(path):
+    if prev == str(path):
         return False
     started = _process_started_at()
     birth = _transcript_birth_ts(path)
-    if started and birth <= started:
-        return False
-    return True
+    return bool(started and birth > started)
 
 
 def _owned_transcript_paths(ids, root=None):
@@ -2447,6 +2443,8 @@ def _mirror_prompt_body(question):
     if is_dispatch_prompt(question):
         return _turn_mirror.format_sent_directive(question or "")
     return _turn_mirror.format_terminal_query(question or "")
+
+
 
 
 def mirror_local_tui_turns():
