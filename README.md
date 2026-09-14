@@ -291,3 +291,17 @@ rather than dropping it.
 ## License
 
 MIT, matching the sibling bridges.
+
+### Suggested follow-ups: on/off
+
+`CUB_SUGGESTED_TAIL_PROMPT=1` (default) asks for a useful optional next request
+on ordinary Telegram prompts. Set it to `0` and restart the bridge to stop adding
+that instruction. Slash commands and direct terminal input remain unchanged.
+Keep `CUB_SUGGESTED_REPLY_SPLIT=1` to render any model-produced tag as a final
+suggestion bubble with **확인** (Confirm). Turning SPLIT off leaves raw markers
+in answers; it does not disable generation.
+
+Confirm pastes and submits the suggestion to Cursor; it does not merely copy to
+the clipboard. The button changes to **✅ 보냄** and repeated clicks do not resend.
+Clear invalidates old buttons. No useful next action means no suggestion is required.
+Older builds ignored the generation switch; this build honors both values.

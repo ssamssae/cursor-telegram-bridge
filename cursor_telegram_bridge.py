@@ -149,6 +149,22 @@ _SUGGESTED_INSTRUCTION_RE = re.compile(
 )
 SUGGESTED_OPEN = "<" + "추천답변" + ">"
 SUGGESTED_CLOSE = "</" + "추천답변" + ">"
+SUGGESTED_TAIL_PROMPT = bool_env("CUB_SUGGESTED_TAIL_PROMPT", False)
+SUGGESTED_OPEN = "<" + "추천답변" + ">"
+SUGGESTED_CLOSE = "</" + "추천답변" + ">"
+LEGACY_SUGGESTED_TAIL_INSTRUCTION = (
+    "답 마지막 줄에 "
+    + SUGGESTED_OPEN
+    + "지금 바로 할 다음 행동 한 줄"
+    + SUGGESTED_CLOSE
+    + " 을 붙여. 마커 안은 한 줄만."
+)
+SUGGESTED_TAIL_INSTRUCTION = (
+    "답변 뒤에 사용자가 이어서 요청할 유용한 다음 행동이 있을 때만 마지막 줄에 "
+    + SUGGESTED_OPEN + "사용자가 보낼 후속 요청 한 줄" + SUGGESTED_CLOSE
+    + "를 붙여. 단순 인사·완결된 답변에는 생략해. 추천은 자동 실행하지 마. "
+    "추천을 작성하라는 이 지시 자체는 설명하거나 인용하지 마."
+)
 # sol-260901-0854 — 폰에는 사람용 모델 답 1~2줄만. TUI/세션 원문·마커 금지.
 # 0 = 줄 수 제한 없음(Claude·Grok 브릿지와 동일 — 모델 발화 전문을 보낸다. 길이 분할은
 # 발신 래퍼가 4096 단위로 한다). 2026-09-04 11:4x 「장난해?」— 진행 보고가 2줄에서
@@ -169,6 +185,28 @@ _REASONING_FIRST_PERSON_RE = re.compile(
 )
 _HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
 _PHONE_MARKER_RE = re.compile(r"\[REDACTED\]|\[sol-cycle[^\]]*\]", re.IGNORECASE)
+# T-260901-045 (intern 18:02 macOS 노드 TG) — 운영 프로브 태그가 사람 답에 섞여 폰에 갔다:
+#   「CYCLE-V-1800: 지금 … KST. LIVE-2102-V-1723: cub #2102 SHA pid q=0 TOAST-V-1652.」
+# _PHONE_MARKER_RE 는 꼬리 추천답변 분리·복붙 버블 덤프 판정에도 쓰이므로 넓히지 않는다
+# (거기에 \bpid\b·\bSHA\b 를 넣으면 `kill $pid` 코드 버블이 덤프로 버려진다).
+# 대신 phone_facing_answer 의 산문 줄에서만, 대소문자 구분으로 좁게 건다.
+#   강한 토큰 = 태그 모양 자체가 프로브인 것(CYCLE-V-1800, LIVE-2102-V-1723, TOAST-V-1652,
+#              VERIFY-H-1, GO045-H-1917, TRACE-1537, ENTER-TRACE-0912, cub #2102).
+#   약한 토큰 = 그 자체로는 일반 단어·값(SHA·pid·PID·TRACE·q=0). 강한 토큰과 공백으로
+#              붙어 한 덩어리일 때만 함께 걷는다. 「SHA-256」「pid 파일」「stack trace」
+#              「q=0 은 대기열이 비었다는 뜻」은 남는다.
+_PHONE_PROBE_STRONG = (
+    r"(?:CYCLE|LIVE|TOAST|VERIFY|ENTER-TRACE|TRACE)(?:-[A-Z0-9]+)+:?"
+    r"|GO[0-9]*(?:-[A-Z0-9]+){2,}:?"
+    r"|cub[ \t]*#[ \t]*[0-9]+"
+)
+_PHONE_PROBE_WEAK = r"SHA|PID|pid|TRACE|q=[0-9]+"
+_PHONE_PROBE_TOKEN = rf"(?:{_PHONE_PROBE_STRONG}|{_PHONE_PROBE_WEAK})"
+_PHONE_PROBE_CLUSTER_RE = re.compile(
+    rf"(?<![A-Za-z0-9_#$/.\-]){_PHONE_PROBE_TOKEN}(?:[ \t]+{_PHONE_PROBE_TOKEN})*"
+    r"(?![A-Za-z0-9_#$/\-])"
+)
+_PHONE_PROBE_STRONG_RE = re.compile(rf"(?:{_PHONE_PROBE_STRONG})")
 _PHONE_DUMP_LINE_RE = re.compile(
     r"(?:^|\b)(?:CONFLICTING|DIRTY)\b|^\s*##\s+main\b|^\s*cub_tui_lane\b|^\s*grb_tui_lane\b",
     re.IGNORECASE,
@@ -182,11 +220,18 @@ _PHONE_AGENT_META_VERBS = (
 _PHONE_AGENT_META_PREFIX_RE = re.compile(
     rf"(?ix)^(?:\*\*(?:{_PHONE_AGENT_META_VERBS})\b[^*]*\*\*\s*)+"
 )
+# T-260914-003 00:54 live: 한글 답 뒤 단독 문단 「I'm thinking...」이 폰에 갔다.
+# thinking 동사는 줄 시작일 때만 잡히고, "I'm thinking" 은 그 앞이 I 라 비껴갔다.
+# (?x) 블록이라 공백은 \s 로만 쓴다.
+_PHONE_THINKING_LINE_RE = re.compile(
+    r"(?ix)^i(?:['’]m|\s+am)\s+thinking\b"
+)
 _PHONE_AGENT_META_LINE_RE = re.compile(
     rf"(?ix)^(?:"
     rf"\*\*(?:{_PHONE_AGENT_META_VERBS})\b[^*]*\*\*"
     rf"|(?:considering|exploring|thinking|analyzing|planning)\s+\S+"
-    rf"|i need to (?:figure|check|investigate|determine|look|see)\b"
+    rf"|i(?:['’]m|\s+am)\s+thinking\b"
+    rf"|i\s+need\s+to\s+(?:figure|check|investigate|determine|look|see)\b"
     rf"|(?:using|invoking|running|calling)\s+(?:the\s+)?[\w./-]+\s+"
     rf"(?:skill|subagent|tool|function)\b"
     rf"|(?:skill|tool|status)\s*:"
@@ -194,6 +239,8 @@ _PHONE_AGENT_META_LINE_RE = re.compile(
     rf")"
 )
 TELEGRAM_ORIGIN_PROMPTS_MAX = 32
+# T-260914-021: 받은지시·터미널질문 카드 1회 미러 이력.
+MIRRORED_PROMPT_MAX = 40
 # T-260905-006 — 오케 배차 운반체는 사람이 터미널에 친 질문이 아니다.
 # 미러가 첫 줄 `[claude-skills HEAD: …]` 를 「터미널에서 물어본 것」으로 폰에 에코하면
 # 사용자가 「뭐냐이게」가 된다. 답은 보내고 라벨만 뺀다.
@@ -369,6 +416,8 @@ def tg(method, timeout=60, **params):
 
 
 def _tmux(*args, input_text=None):
+    if acp_enabled():
+        raise RuntimeError("ACP transport must not send TUI keys")
     cmd = ["tmux", "-L", TMUX_SOCKET, *args]
     return subprocess.run(
         cmd,
@@ -477,13 +526,20 @@ def _tui_layout_skip_keys(screen):
 
 
 def _tui_compose_line(screen):
-    """입력칸 `→ …` 줄의 본문. 없으면 빈 문자열."""
+    """Read the input row, excluding slash-menu selection rows in any language.
+
+    Menu rows contain a command token followed by a description column. They
+    can be below the composer and use the same arrow; never use their label as
+    user input. A menu without a visible composer is unknown.
+    """
     for line in reversed((screen or "").splitlines()):
-        stripped = line.strip()
-        if stripped.startswith("→"):
-            return stripped[1:].strip()
-        if stripped.startswith("->"):
-            return stripped[2:].strip()
+        match = re.match(r"^ {0,2}(?:→|->)\s?(.*)$", line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if re.match(r"^/[^\s]+\s{2,}\S", value):
+            continue
+        return value
     return ""
 
 
@@ -1014,6 +1070,9 @@ def _stale_token_transcript(path, token, started_at, rows=None):
 def _pick_active_transcript_path(prior_path=None, pasted_text=None):
     """한 번 스캔 — paste 직후 mtime-only newest 가 옛 일기장일 수 있다."""
     paths = list_transcript_paths()
+    owned = _pane_owned_chat_ids()
+    if owned is not None:
+        paths = [p for p in paths if _transcript_session_id(p) in owned]
     if not paths:
         return None
     token = (pasted_text or "").strip()
@@ -1062,6 +1121,13 @@ def resolve_active_transcript_path(prior_path=None, pasted_text=None, deadline=N
 
 def reset_cursor_harvest_state():
     """/clear 뒤 옛 pin(hello 전 세션)이 새 일기장 회수를 막지 않게 커서를 비운다."""
+    rec = load_cursor_state()
+    if rec:
+        _tui_json_save(CURSOR_FILE + ".history", {
+            "handled_paths": rec.get("handled_paths", {}),
+            "telegram_prompts": rec.get("telegram_prompts", []),
+            "mirrored_prompts": rec.get("mirrored_prompts", []),
+        })
     try:
         os.remove(CURSOR_FILE)
     except FileNotFoundError:
@@ -1259,10 +1325,11 @@ def handle_context_command(source="telegram"):
         return
     screen = _tui_capture_pane()
     pct = parse_tui_context_percent(screen)
-    if pct is None and not _tui_context_result_overlay(screen):
-        # slash Enter 직후 오버레이/상태줄이 한 프레임 늦을 수 있다.
-        # #2105 Waiting 가림 재시도와 다른 축 — 한 번만 더 읽는다.
-        time.sleep(TUI_SUBMIT_DELAY)
+    for _ in range(2):
+        if pct is not None or _tui_context_result_overlay(screen):
+            break
+        # Waiting/slash overlays may hide the footer for two frames (T-260901-035).
+        time.sleep(min(max(TUI_SUBMIT_DELAY, 0.05), 0.2))
         screen = _tui_capture_pane()
         pct = parse_tui_context_percent(screen)
     if _tui_context_result_overlay(screen):
@@ -1502,7 +1569,7 @@ def _context_guard_assert_pending_clear():
     """Recheck immediately before Enter, including retries of our own /clear."""
     screen = _tui_capture_pane()
     compose = _tui_compose_line(screen)
-    owns_clear = re.fullmatch(r"/clear(?:\s{2,}Start a new chat.*)?", compose)
+    owns_clear = compose == "/clear"
     if (not owns_clear or _tui_pane_shows_guard_busy(screen)
             or is_awaiting_human() or _TUI_RESET.is_set()
             or _TUI_JOB_ACTIVE.is_set() or _TUI_TURN_BUSY.is_set()
@@ -1516,7 +1583,7 @@ def _context_guard_discard_own_clear():
         return False
     screen = _tui_capture_pane()
     compose = _tui_compose_line(screen)
-    if (not re.fullmatch(r"/clear(?:\s{2,}Start a new chat.*)?", compose)
+    if (not compose == "/clear"
             or _TUI_JOB_ACTIVE.is_set() or not JOBS.empty()
             or _context_guard_inflight_active()
             or _tui_pane_shows_approval_overlay(screen)):
@@ -1556,51 +1623,151 @@ def handle_tui_reset(source="telegram"):
         return _handle_tui_reset_locked(source)
 
 
+def _reset_journal_path():
+    return os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.reset-operation.json")
+
+
+def _reset_identity():
+    # Bypass the normal mirror cache: reset confirmation must observe live IDs.
+    _PANE_OWNED_CACHE["at"] = 0.0
+    return _tmux_pane_pid(), _pane_owned_chat_ids()
+
+
+def _reset_journal_write(record, phase, **fields):
+    record.update(fields, phase=phase, updated_at=time.time())
+    _tui_json_save(_reset_journal_path(), record)
+
+
+def _reset_screen_safe(screen, pending=False):
+    compose_ok = (_tui_compose_line(screen) == "/clear" if pending
+                  else _tui_compose_shows_idle_placeholder(screen))
+    return (compose_ok and not _tui_pane_shows_guard_busy(screen)
+            and not _TUI_JOB_ACTIVE.is_set() and not _TUI_TURN_BUSY.is_set())
+
+
+def _reset_empty_session(screen, ids):
+    return (ids == set() and bool(re.search(r"(?m)^\s*Cursor Agent\s*$", screen))
+            and _tui_compose_line(screen).lower().startswith("plan, search")
+            and _reset_screen_safe(screen))
+
+
+def _tui_verified_reset(source):
+    """One paste/Enter; confirm a new chat ID or closed store + empty start UI.
+
+    A persisted ambiguous operation blocks automatic replay after restart.
+    Human keyboard input cannot be locked; recapture immediately before each
+    key and refuse to delete changed input or send keys into an active turn.
+    """
+    previous = _tui_json_load(_reset_journal_path()) or {}
+    before_pid, before_ids = _reset_identity()
+    screen = _tui_capture_pane()
+    if previous.get("phase") in {"prepared", "pasted", "submitted", "unknown"}:
+        if (before_pid == previous.get("pid") and _reset_empty_session(screen, before_ids)
+                and previous.get("phase") in {"submitted", "unknown"}):
+            _reset_journal_write(previous, "confirmed", confirmation="previous_store_closed_and_empty_start_screen")
+            return True
+        raise RuntimeError("이전 /clear 결과 미확인 — 자동 재전송 없이 확인 필요")
+    if before_pid and _reset_empty_session(screen, before_ids):
+        _reset_journal_write({"pid": before_pid, "source": source}, "confirmed", confirmation="already_empty")
+        return True
+    if not before_pid or not before_ids:
+        raise RuntimeError("/clear 전 현재 Cursor 세션 식별 불가")
+    if not _reset_screen_safe(_tui_capture_pane()):
+        raise RuntimeError("작업 중이거나 입력칸이 비어 있지 않아 /clear 보류")
+    record = {"source": source, "pane": TMUX_PANE, "pid": before_pid,
+              "before_ids": sorted(before_ids), "operation_id": str(time.time_ns())}
+    _reset_journal_write(record, "prepared")
+    submitted = False
+    pasted = False
+    try:
+        buffer = "cursor-reset-" + record["operation_id"]
+        proc = _tmux("load-buffer", "-b", buffer, "-", input_text="/clear")
+        if proc.returncode:
+            raise RuntimeError("/clear buffer 준비 실패")
+        if (not _reset_screen_safe(_tui_capture_pane()) or _reset_identity() != (before_pid, before_ids)
+                or (source == "context-guard" and (not JOBS.empty() or is_awaiting_human()
+                    or _context_guard_inflight_active() or _context_guard_transcript_blocks_clear()))):
+            raise RuntimeError("/clear 입력 전 상태 변경")
+        proc = _tmux("paste-buffer", "-b", buffer, "-d", "-p", "-t", TMUX_PANE)
+        pasted = True
+        _reset_journal_write(record, "pasted")
+        if proc.returncode:
+            raise RuntimeError("/clear paste 결과 불명")
+        time.sleep(TUI_SUBMIT_DELAY)
+        if (not _reset_screen_safe(_tui_capture_pane(), pending=True) or _reset_identity() != (before_pid, before_ids)
+                or (source == "context-guard" and (not JOBS.empty() or is_awaiting_human()
+                    or _context_guard_inflight_active() or _context_guard_transcript_blocks_clear()))):
+            raise RuntimeError("/clear 제출 전 입력 또는 작업 상태 변경")
+        # Persist BEFORE Enter: process death must never authorize a replay.
+        submitted = True
+        _reset_journal_write(record, "submitted")
+        proc = _tmux("send-keys", "-t", TMUX_PANE, TUI_SUBMIT_KEY)
+        if proc.returncode:
+            raise RuntimeError("/clear Enter 결과 불명")
+        deadline = time.monotonic() + 10.0
+        empty_observations = 0
+        while time.monotonic() < deadline:
+            pid, ids = _reset_identity()
+            screen = _tui_capture_pane()
+            if pid != before_pid:
+                raise RuntimeError("/clear 확인 중 Cursor 프로세스 변경")
+            if ids and ids - before_ids and _reset_screen_safe(screen):
+                _reset_journal_write(record, "confirmed", after_ids=sorted(ids), confirmation="new_live_chat_id")
+                return True
+            empty_observations = empty_observations + 1 if _reset_empty_session(screen, ids) else 0
+            if empty_observations >= 2:
+                _reset_journal_write(record, "confirmed", confirmation="previous_store_closed_and_empty_start_screen")
+                return True
+            time.sleep(0.2)
+        raise RuntimeError("/clear 초기화 미확인 — 완료 알림과 재전송 보류")
+    except Exception:
+        cancelled = not pasted
+        if pasted and not submitted:
+            screen = _tui_capture_pane()
+            if (_reset_screen_safe(screen, pending=True)
+                    and _reset_identity() == (before_pid, before_ids)):
+                _tmux("send-keys", "-t", TMUX_PANE, "Escape")
+                time.sleep(TUI_SUBMIT_DELAY)
+                if _reset_screen_safe(_tui_capture_pane(), pending=True):
+                    _tui_erase_compose(len("/clear"))
+                    cancelled = _tui_compose_shows_idle_placeholder(_tui_capture_pane())
+        _reset_journal_write(record, "cancelled" if cancelled else "unknown")
+        raise
+
+
 def _handle_tui_reset_locked(source):
     global _HARVEST_GEN
     auto = source == "context-guard"
     if auto and _context_guard_ready_to_clear() is None:
-        print(f"{LOG_KEY} context-guard 재검사 — busy/불명이라 /clear 안 함", file=sys.stderr)
         return False
-    if auto:
-        # Admission and composer locks keep bridge/fleet writers outside this
-        # window. Never set the cancellation flag or discard queued work.
-        _COMPOSER_LOCK_HELD.auto_clear = True
-        try:
-            _tui_paste("/clear", interrupt=False)
-        except Exception:
-            _context_guard_discard_own_clear()
-            raise
-        finally:
-            _COMPOSER_LOCK_HELD.auto_clear = False
-        if not _TUI_JOB_ACTIVE.is_set() and JOBS.empty() and not _context_guard_inflight_active():
-            reset_cursor_harvest_state()
-            forget_suggested_replies()
-        return True
-    _TUI_RESET.set()
+    if not tui_session_alive():
+        if not auto:
+            deliver_mesh_event("error", tui_dead_message())
+        return False
+    # No queue/harvest/awaiting-human mutation until Cursor confirms reset.
+    try:
+        _tui_verified_reset(source)
+    except Exception as exc:
+        print(f"{LOG_KEY} reset not confirmed: {exc}", file=sys.stderr)
+        if not auto:
+            deliver_mesh_event("error", str(exc))
+        else:
+            rec = _tui_json_load(_reset_journal_path()) or {}
+            if rec.get("phase") == "unknown" and not rec.get("notified"):
+                deliver_mesh_event("report", "자동 /clear 결과가 미확인이라 반복을 멈췄습니다. 현재 입력과 세션을 확인해야 합니다.")
+                _reset_journal_write(rec, "unknown", notified=True)
+        return False
     _HARVEST_GEN += 1
-    dropped = drain_pending_jobs()
+    if not auto:
+        dropped = drain_pending_jobs()
+        set_awaiting_human()
+        _tui_inflight_clear()
+        if dropped:
+            print(f"{LOG_KEY} /clear 대기잡 {dropped}건 폐기", file=sys.stderr)
+    reset_cursor_harvest_state()
     forget_suggested_replies()
     if not auto:
-        set_awaiting_human()
-    reset_cursor_harvest_state()
-    _tui_inflight_clear()
-    if dropped:
-        print(f"{LOG_KEY} /clear 대기잡 {dropped}건 폐기", file=sys.stderr)
-    if tui_session_alive():
-        try:
-            _tui_paste("/clear", interrupt=False)
-        except Exception as exc:  # noqa: BLE001
-            deliver_mesh_event("error", f"커서 /clear 주입 실패: {exc}")
-            _TUI_RESET.clear()
-            return False
-    else:
-        deliver_mesh_event("error", tui_dead_message())
-        _TUI_RESET.clear()
-        return False
-    if not auto:
         notify_tui_cleared()
-    _TUI_RESET.clear()
     return True
 
 
@@ -1658,21 +1825,20 @@ def maybe_auto_clear_idle_context(now=None, screen=None):
 
 
 def with_suggested_tail_instruction(text):
-    """TUI/헤드리스 프롬프트에는 추천답 꼬리를 넣지 않는다.
-
-    그록 paste 는 원문만 넣는다. cub 이 꼬리를 붙이면 모델이 본문에
-    <추천답변>·Considering·AskQuestion 을 적는다 (intern 2026-09-02).
-    """
+    """Append an optional next-step request only to ordinary bridge prompts."""
     payload = (text or "").rstrip()
-    return payload  # no suggested-reply tail in prompt
+    if (not SUGGESTED_TAIL_PROMPT or not payload or payload.lstrip().startswith("/")
+            or payload.endswith(SUGGESTED_TAIL_INSTRUCTION)):
+        return payload
+    return payload + "\n\n" + SUGGESTED_TAIL_INSTRUCTION
 
 
 def strip_suggested_tail_instruction(text):
-    """미러·일기장 조회용. 붙여 넣은 꼬리 지시는 질문 본문이 아니다."""
+    """Keep both current and previously stored instruction tails out of mirrors."""
     raw = (text or "").rstrip()
-    marker = SUGGESTED_TAIL_INSTRUCTION
-    if raw.endswith(marker):
-        return raw[: -len(marker)].rstrip()
+    for marker in (SUGGESTED_TAIL_INSTRUCTION, LEGACY_SUGGESTED_TAIL_INSTRUCTION):
+        if raw.endswith(marker):
+            return raw[:-len(marker)].rstrip()
     return raw
 
 
@@ -1681,17 +1847,61 @@ def _tui_paste(prompt, *, interrupt=False):
         _tui_paste_unlocked(prompt, interrupt=interrupt)
 
 
+def _tui_pane_shows_running_stop_cue(screen):
+    """Running / ctrl+c to stop 등 실제 턴을 끊을 수 있는 표시만 True.
+
+    승인·모델 피커·빈 compose 에서는 False — 빈칸 C-c 는 취소 패널 회귀다
+    (T-260914-017).
+    """
+    if _tui_pane_shows_approval_overlay(screen):
+        return False
+    if _tui_pane_shows_model_picker(screen):
+        return False
+    if _tui_repl_shows_turn_started(screen):
+        return True
+    if _tui_pane_shows_steer_overlay(screen):
+        return True
+    tail = "\n".join((screen or "").splitlines()[-16:])
+    low = tail.lower()
+    if "ctrl+c" in low or "ctrl-c" in low or "⌃c" in tail or "to stop" in low:
+        return True
+    if re.search(r"(?i)\brunning\b", tail) and "run everything" not in low:
+        return True
+    if re.search(r"(?i)\bgenerating\b", tail) or re.search(r"(?i)\bthinking\b", tail):
+        return True
+    return False
+
+
+# busy 중 사람 중지 요청만 Ctrl+C. 일반 follow-up 은 줄서기(C-c 없음).
+_BUSY_STOP_REQUEST_RE = re.compile(
+    r"(?is)^\s*(?:"
+    r"그만(?:해|둬|쳐|하(?:자|세요|요)?|하기)?"
+    r"|멈춰(?:라|줘|요|세요)?"
+    r"|중단(?:해(?:줘|주세요)?|하기)?"
+    r"|취소(?:해(?:줘|주세요)?|하기)?"
+    r"|stop(?:\s+it)?"
+    r"|cancel(?:\s+it)?"
+    r"|abort"
+    r")\s*[!.。]*\s*$"
+)
+
+
+def is_busy_stop_request(text):
+    """텔레그램 본문이 busy 중지키워드(그만해/멈춰/stop/취소 등)인지."""
+    return bool(_BUSY_STOP_REQUEST_RE.match((text or "").strip()))
+
+
 def _tui_paste_unlocked(prompt, *, interrupt=False):
     original = (prompt or "").rstrip("\n")
     payload = with_suggested_tail_instruction(original)
     payload = payload.rstrip("\n")
     if not payload:
         return
-    # 그록 현행과 같이 본문은 send-keys 로 치지 않는다. C-c 는 Cursor TUI
-    # 턴을 죽이므로 쓰지 않는다. Space 는 스크롤백/follow-up 목록에서
+    # 본문은 send-keys 로 치지 않는다. Space 는 스크롤백/follow-up 목록에서
     # 입력칸으로 초점을 옮긴다 — 없으면 Enter 가 steer 로 먹혀 compose 에
     # 글만 남는다 (ENTER-TRACE-1537).
-    del interrupt
+    # T-260914-017: interrupt=True 이고 Running/ctrl+c to stop 이면 Ctrl+C 후 paste.
+    # 빈칸·승인 오버레이에서는 C-c 를 보내지 않는다.
     path = newest_transcript_path()
     screen = _tui_capture_pane()
     if getattr(_COMPOSER_LOCK_HELD, "auto_clear", False):
@@ -1699,6 +1909,16 @@ def _tui_paste_unlocked(prompt, *, interrupt=False):
             raise RuntimeError("context-guard: state changed before paste")
     if _tui_pane_shows_approval_overlay(screen):
         raise RuntimeError("TUI 승인 대기 중 — 키 주입 금지")
+    if interrupt:
+        if _tui_pane_shows_running_stop_cue(screen):
+            print(f"{LOG_KEY} busy stop — Ctrl+C 후 paste", file=sys.stderr)
+            _tmux("send-keys", "-t", TMUX_PANE, "C-c")
+            time.sleep(TUI_SUBMIT_DELAY)
+            screen = _tui_capture_pane()
+            if _tui_pane_shows_approval_overlay(screen):
+                raise RuntimeError("TUI 승인 대기 중 — 키 주입 금지")
+        else:
+            print(f"{LOG_KEY} interrupt 요청이지만 stop cue 없음 — C-c 생략", file=sys.stderr)
     if _tui_is_native_slash_prompt(payload):
         # Hermes live: Space+/clear 는 /fleet-clear·/session-clear 스킬 팔레트.
         print(f"{LOG_KEY} TUI 슬래시 — Space 생략", file=sys.stderr)
@@ -2038,12 +2258,40 @@ def last_tool_flow_line(rows) -> str:
     return _flow_progress.FLOW_STAGE_WORK if rows else ""
 
 
-def _cursor_flow_close(status: str, started: float, last_stage: str) -> None:
-    if not cursor_flow_enabled() or not last_stage:
-        return
-    label = _flow_progress.flow_done_label(status)
-    elapsed = _flow_progress.format_flow_elapsed(time.time() - started)
-    deliver_mesh_event("report", f"{label} · 소요 {elapsed}")
+class CursorFlowCard:
+    """One report bubble per wait loop; edits never fall back to new sends."""
+
+    def __init__(self, started):
+        self.started = started
+        self.message_id = None
+        self.attempted = False
+        self.steps = []
+
+    def update(self, stage="", *, status=None):
+        if not cursor_flow_enabled():
+            return
+        if stage and (not self.steps or self.steps[-1] != stage):
+            self.steps.append(stage[:160])
+            self.steps = self.steps[-8:]
+        if not self.steps:
+            return
+        body = "\n".join(self.steps)
+        if status:
+            elapsed = _flow_progress.format_flow_elapsed(time.time() - self.started)
+            body += f"\n\n→ {_flow_progress.flow_done_label(status)} · 소요 {elapsed}"
+        if self.message_id:
+            deliver_mesh_event("report", body, telegram_method="editMessageText",
+                               message_id=self.message_id)
+        elif not self.attempted:
+            # Ambiguous/failed sends must not create a bubble on every next stage.
+            self.attempted = True
+            result = deliver_mesh_event("report", body)
+            self.message_id = _first_sent_message_id(result, surface="direct")
+
+
+def _cursor_flow_close(status: str, started: float, last_stage: str, card=None) -> None:
+    if card is not None:
+        card.update(status=status)
 
 
 def assistant_texts(rows):
@@ -2165,6 +2413,15 @@ def load_cursor_state(path=None):
         rec = json.loads(_read(CURSOR_FILE) or "{}")
     except json.JSONDecodeError:
         rec = {}
+    history = _tui_json_load(CURSOR_FILE + ".history")
+    handled = dict(history.get("handled_paths") or {})
+    handled.update(rec.get("handled_paths") or {})
+    if handled:
+        rec["handled_paths"] = handled
+    if not rec.get("telegram_prompts") and history.get("telegram_prompts"):
+        rec["telegram_prompts"] = history["telegram_prompts"]
+    if not rec.get("mirrored_prompts") and history.get("mirrored_prompts"):
+        rec["mirrored_prompts"] = history["mirrored_prompts"]
     if path is not None and rec.get("path") != str(path):
         return {"path": str(path), "rows": 0, "last_final": ""}
     return rec
@@ -2232,6 +2489,88 @@ def is_telegram_origin_prompt(question):
     rec = load_cursor_state()
     seen = {str(item) for item in (rec.get("telegram_prompts") or []) if str(item).strip()}
     return key in seen
+
+
+def _prompt_mirror_keys():
+    rec = load_cursor_state()
+    return [str(item) for item in (rec.get("mirrored_prompts") or []) if str(item).strip()]
+
+
+def was_prompt_mirrored(text):
+    key = normalize_origin_prompt(text)
+    return bool(key) and key in set(_prompt_mirror_keys())
+
+
+def remember_prompt_mirrored(text):
+    key = normalize_origin_prompt(text)
+    if not key:
+        return
+    rec = load_cursor_state()
+    seen = [str(item) for item in (rec.get("mirrored_prompts") or []) if str(item).strip()]
+    if key in seen:
+        return
+    seen.append(key)
+    rec["mirrored_prompts"] = seen[-MIRRORED_PROMPT_MAX:]
+    _write(CURSOR_FILE, json.dumps(rec, ensure_ascii=False))
+
+
+def emit_received_directive_card(text):
+    """텔레그램·배차 주입 즉시 Codex식 📥 받은 지시 카드 (T-260914-021)."""
+    card = _turn_mirror.format_received_directive(text or "")
+    if not card:
+        return False
+    if was_prompt_mirrored(text):
+        return False
+    try:
+        deliver_mesh_event("report", card)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{LOG_KEY} 받은 지시 카드 실패: {exc}", file=sys.stderr)
+        return False
+    remember_prompt_mirrored(text)
+    print(f"{LOG_KEY} 받은 지시 카드", flush=True)
+    return True
+
+
+def emit_prompt_mirror_once(question):
+    """터미널/배차 질문 라벨 1회. 받은지시·기존 미러와 중복하지 않는다."""
+    if not question or was_prompt_mirrored(question):
+        return False
+    if is_telegram_origin_prompt(question):
+        return False
+    body = _mirror_prompt_body(question)
+    if not body:
+        return False
+    try:
+        deliver_mesh_event("report", body)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{LOG_KEY} prompt mirror 실패: {exc}", file=sys.stderr)
+        return False
+    remember_prompt_mirrored(question)
+    return True
+
+
+def latest_open_user_query(rows):
+    """아직 텍스트-only final 이 없는 마지막 user_query (busy 중 즉시 미러용)."""
+    open_q = ""
+    pending = False
+    for row in rows or []:
+        if row.get("role") == "user":
+            q = user_query_text(row)
+            if q:
+                open_q = q
+                pending = True
+            continue
+        if row.get("type") == "turn_ended":
+            pending = False
+            continue
+        if row.get("role") != "assistant":
+            continue
+        if row_has_tool_use(row):
+            # 도구 중이면 질문은 열린 채 — pending 유지
+            continue
+        if "\n".join(_content_texts(row)).strip():
+            pending = False
+    return open_q if pending else ""
 
 
 def is_dispatch_prompt(question):
@@ -2333,13 +2672,18 @@ def _harvest_orphaned_finals_locked(path):
             already = len(texts)
         last = str(rec.get("last_final") or "")
     sent = 0
-    for text in texts[already:]:
+    for final_index, text in enumerate(texts[already:], start=already):
         if not text or text == last:
             continue
-        deliver_cursor_answer(text)
+        receipt = deliver_cursor_answer(text)
+        if isinstance(receipt, dict) and receipt.get("result") == "filtered_empty":
+            continue
+        if not _mesh_delivery_sent(receipt):
+            return sent
+        save_cursor(path, len(rows), last_final=text,
+                    finals_sent=final_index + 1, delivered_final=text)
         last = text
         sent += 1
-    save_cursor(path, len(rows), last_final=last, finals_sent=len(texts))
     if sent:
         print(f"{LOG_KEY} orphaned final harvest {sent}건", flush=True)
     return sent
@@ -2355,6 +2699,8 @@ def _is_reasoning_prose_para(para):
     first = s.lstrip()
     if first.startswith(("|", "- ", "* ", "#", ">", "[")) or re.match(r"^\d+[.)]\s", first):
         return False
+    if _PHONE_THINKING_LINE_RE.match(s) or _is_phone_agent_meta_line(s):
+        return True
     return sum(ch.isalpha() for ch in s) >= 40
 
 
@@ -2390,11 +2736,28 @@ def strip_trailing_reasoning(text):
     return head.rstrip()
 
 
+
+def _markdown_table_row_to_bullet(line):
+    """GFM 표 한 줄을 TG용 '- a · b' 불릿으로. 구분선(| --- |)은 빈 문자열.
+
+    phone_facing_answer 가 예전에 startswith('|') 표를 continue로 버려 CUB 티켓
+    표가 폰에서 사라졌다(T-260915-001). 셀만 남기고 파이프는 걷는다.
+    """
+    s = str(line or "").strip()
+    if not (s.startswith("|") and s.count("|") >= 2):
+        return s
+    cells = [c.strip() for c in s.strip("|").split("|")]
+    if cells and all(not c or set(c) <= set("-: ") for c in cells):
+        return ""
+    body = " · ".join(c for c in cells if c)
+    return f"- {body}" if body else ""
+
+
 def phone_facing_answer(text, max_lines=None):
     """텔레그램 사람용 답. 세션/TUI 원문·마커·도구 덤프를 걷고 모델 발화만 남긴다.
 
-    재현: Cursor 브릿지만 [REDACTED]·[sol-cycle]·CONFLICTING/DIRTY·표/코드
-    펜스를 폰에 흘렸다. 그록 브릿지는 모델 발화만 보낸다. 3노드 cub 공용.
+    재현: Cursor 브릿지만 [REDACTED]·[sol-cycle]·CONFLICTING/DIRTY·코드
+    펜스를 폰에 흘렸다. 마크다운 표는 삭제하지 않고 불릿으로 바꾼다. 그록 브릿지는 모델 발화만 보낸다. 3노드 cub 공용.
     줄 수는 기본 무제한(max_lines/CUB_PHONE_MAX_LINES 0). 단락 사이 빈 줄 하나는
     유지해 긴 보고의 구조가 폰에서도 읽히게 한다.
     """
@@ -2426,11 +2789,38 @@ def phone_facing_answer(text, max_lines=None):
         if SUGGESTED_OPEN in s or SUGGESTED_CLOSE in s:
             continue
         if s.startswith("|") and s.count("|") >= 2:
+            # T-260915-001: TG는 마크다운 표를 거의 안 보여 주므로 삭제 대신 불릿.
+            s = _markdown_table_row_to_bullet(s)
+            if not s:
+                continue
+        s = strip_phone_probe_tags(s)
+        if not s:
             continue
         kept.append(s)
         if limit and len([k for k in kept if k]) >= limit:
             break
     return "\n".join(kept).strip()
+
+
+def _probe_cluster_repl(match):
+    # 강한 토큰이 하나라도 있는 덩어리만 걷는다. SHA·pid 만 있는 덩어리는 사람 말이다.
+    return " " if _PHONE_PROBE_STRONG_RE.search(match.group(0)) else match.group(0)
+
+
+def strip_phone_probe_tags(line):
+    """산문 한 줄에서 운영 프로브 태그 덩어리(T-260901-045)만 걷는다.
+
+    태그가 없던 줄은 바이트 그대로 돌려준다(공백·마크다운 보존). 태그를 걷은 줄만
+    남은 공백·「. .」·머리 구두점을 정리한다. 코드 펜스 안은 호출자가 이미 건넌다.
+    """
+    s = str(line or "")
+    cleaned = _PHONE_PROBE_CLUSTER_RE.sub(_probe_cluster_repl, s)
+    if cleaned == s:
+        return s
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    cleaned = re.sub(r"(?:\s*\.){2,}", ".", cleaned)
+    cleaned = re.sub(r"^[.:;\-]+\s*", "", cleaned)
+    return cleaned.strip()
 
 
 def _is_phone_agent_meta_line(s):
@@ -2450,20 +2840,24 @@ def _mirror_prompt_body(question):
 def mirror_local_tui_turns():
     """tmux 창에 직접 친 턴을 폰으로 올린다. 그록 GRB_TUI_MIRROR_LOCAL 동형.
 
-    켠 순간 과거 일기장은 안 쏟는다. 텔레그램 잡이 도는 동안엔 비킨다.
-    생각 중(tool_use)이면 답이 끝날 때까지 기다린다.
+    켠 순간 과거 일기장은 안 쏟는다. 텔레그램 잡이 도는 동안엔 답 회수는 비킨다.
+    T-260914-021: busy 중이어도 열린 터미널/배차 질문은 즉시 1회 미러한다.
+    생각 중(tool_use)이면 답은 끝날 때까지 기다린다.
     """
     if not TUI_MIRROR_LOCAL:
-        return 0
-    if _TUI_JOB_ACTIVE.is_set():
         return 0
     path = newest_transcript_path()
     if not path:
         _TUI_TURN_BUSY.clear()
         return 0
     with _HARVEST_LOCK:
+        rows = read_transcript_rows(path)
+        prompt_sent = 0
+        open_q = latest_open_user_query(rows)
+        if open_q and emit_prompt_mirror_once(open_q):
+            prompt_sent = 1
         if _TUI_JOB_ACTIVE.is_set():
-            return 0
+            return prompt_sent
         job = _tui_inflight_load()
         if job and job.get("text"):
             path, _, rebound = _maybe_rebind_active_transcript(
@@ -2472,10 +2866,10 @@ def mirror_local_tui_turns():
             )
             if rebound:
                 print(f"{LOG_KEY} pending reply rebound to {path}", flush=True)
-        rows = read_transcript_rows(path)
+                rows = read_transcript_rows(path)
         if tail_is_busy(rows):
             _TUI_TURN_BUSY.set()
-            return 0
+            return prompt_sent
         _TUI_TURN_BUSY.clear()
         pairs = assistant_final_pairs(rows)
         rec = load_cursor_state()
@@ -2498,9 +2892,10 @@ def mirror_local_tui_turns():
             last = str(handled.get("last_final") or "")
         else:
             save_cursor(path, len(rows), last_final=str(rec.get("last_final") or ""), finals_sent=len(pairs))
-            return 0
+            return prompt_sent
         if already > len(pairs):
             already = len(pairs)
+        # sent = 답 배달 건수(기존 계약). 질문 카드는 prompt_sent 로만 센다.
         sent = 0
         for pair_index, (question, answer) in enumerate(pairs[already:], start=already):
             if not answer or answer == last:
@@ -2513,26 +2908,24 @@ def mirror_local_tui_turns():
                     last = answer
                     continue
                 if not _mesh_delivery_sent(deliver_cursor_answer(answer)):
-                    return sent
+                    return sent or prompt_sent
                 rec["delivered_final"] = answer
                 save_cursor(path, len(rows), delivered_final=answer,
                             last_final=answer, finals_sent=pair_index + 1)
                 last = answer
                 sent += 1
                 continue
-            prompt = _mirror_prompt_body(question)
-            if prompt:
-                deliver_mesh_event("report", prompt)
+            emit_prompt_mirror_once(question)
             if not _mesh_delivery_sent(deliver_cursor_answer(answer)):
-                return sent
+                return sent or prompt_sent
             save_cursor(path, len(rows), delivered_final=answer,
                         last_final=answer, finals_sent=pair_index + 1)
             last = answer
             sent += 1
         save_cursor(path, len(rows), last_final=last, finals_sent=len(pairs))
-        if sent:
-            print(f"{LOG_KEY} local mirror {sent}건", flush=True)
-        return sent
+        if sent or prompt_sent:
+            print(f"{LOG_KEY} local mirror answers={sent} prompts={prompt_sent}", flush=True)
+        return sent or prompt_sent
 
 
 def tui_local_mirror_ticker():
@@ -2612,14 +3005,15 @@ def wait_for_final(path, baseline, deadline, gen=None, *, pasted_text=None, prio
     last_answer = ""
     last_stage = ""
     started = time.time()
+    flow_card = CursorFlowCard(started)
     hard_deadline = deadline - TUI_WAIT_SEC + max(TUI_WAIT_MAX_SEC, TUI_WAIT_SEC)
     extended = False
     while True:
         if _TUI_RESET.is_set():
-            _cursor_flow_close("interrupt", started, last_stage)
+            _cursor_flow_close("interrupt", started, last_stage, flow_card)
             return "", path
         if gen is not None and gen != _HARVEST_GEN:
-            _cursor_flow_close("cancelled", started, last_stage)
+            _cursor_flow_close("cancelled", started, last_stage, flow_card)
             return "", path
         path, baseline, rebound = _maybe_rebind_active_transcript(
             path, baseline, prior_path, pasted_text
@@ -2639,15 +3033,15 @@ def wait_for_final(path, baseline, deadline, gen=None, *, pasted_text=None, prio
                 stage = last_tool_flow_line(turn_rows)
                 if stage and stage != last_stage:
                     last_stage = stage
-                    deliver_mesh_event("report", stage)
+                    flow_card.update(stage)
         if last_answer and not tail_is_busy(rows):
             if turn_has_ended(rows) or (time.time() - last_change) >= TUI_IDLE_SEC:
-                _cursor_flow_close("sent", started, last_stage)
+                _cursor_flow_close("sent", started, last_stage, flow_card)
                 return last_answer, path
         now = time.time()
         if now >= deadline:
             if not turn_still_running(rows, last_change, now, hard_deadline):
-                _cursor_flow_close("timeout", started, last_stage)
+                _cursor_flow_close("timeout", started, last_stage, flow_card)
                 return last_answer, path
             if not extended:
                 extended = True
@@ -2675,7 +3069,8 @@ def _tg_chunks(text, limit):
 
 
 def deliver_mesh_event(
-    kind, body, *, task_id=None, reply_markup=None, telegram_code_entity=None
+    kind, body, *, task_id=None, reply_markup=None, telegram_code_entity=None,
+    telegram_method=None, message_id=None
 ):
     """Send one message straight to the Telegram Bot API.
 
@@ -3384,7 +3779,7 @@ def deliver_cursor_answer(text, task_id=None):
     copy_bubbles = [c for c in copy_bubbles if not _copy_bubble_is_dump(c)]
     body = phone_facing_answer(body)
     if not body and not copy_bubbles:
-        return {}
+        return {"result": "filtered_empty"}
     bubble = {}
     if body:
         bubble = deliver_mesh_event("final", body, task_id=task_id)
@@ -3451,23 +3846,38 @@ def maybe_busy_inject_telegram(text, source):
         return False
     path = newest_transcript_path()
     baseline = len(read_transcript_rows(path)) if path else 0
+    # T-260914-017: 중지키워드만 Ctrl+C. 일반 follow-up 은 줄서기(interrupt=False).
+    stop = is_busy_stop_request(text)
     try:
-        _tui_paste(text, interrupt=True)
+        _tui_paste(text, interrupt=stop)
     except Exception as exc:  # noqa: BLE001
         print(f"{LOG_KEY} busy 삽입 실패 — 큐로 넘김: {exc}", file=sys.stderr)
         return False
     if path:
         _tui_inflight_write(_inflight_payload(path, baseline, source, text))
-    print(f"{LOG_KEY} busy 중 텔레그램 삽입", file=sys.stderr)
-    # grb 동형 ack. Cursor 는 턴을 끊지 않고 follow-up 큐에 세우므로 문구만 다르다.
+    print(
+        f"{LOG_KEY} busy 중 텔레그램 {'중지 삽입' if stop else '삽입'}",
+        file=sys.stderr,
+    )
     try:
-        deliver_mesh_event("ack", "지금 하던 일 뒤에 줄 세웠어. 이 턴 끝나면 바로 이어서 본다.")
+        if stop:
+            deliver_mesh_event("ack", "하던 일을 끊고 방금 말을 넣었어.")
+        else:
+            deliver_mesh_event(
+                "ack",
+                "지금 하던 일 뒤에 줄 세웠어. 이 턴 끝나면 바로 이어서 본다.",
+            )
     except Exception as exc:  # noqa: BLE001
         print(f"{LOG_KEY} busy 삽입 ack 실패: {exc}", file=sys.stderr)
     return {"kind": "injected_harvest", "baseline": baseline, "path": str(path or "")}
 
 
 def process_job(source, text, meta=None):
+    if acp_enabled():
+        _TUI_JOB_ACTIVE.set()
+        try: acp_bridge().run(meta["acp_outbox"])
+        finally: _TUI_JOB_ACTIVE.clear()
+        return
     with _TUI_ADMISSION_LOCK:
         if _TUI_RESET.is_set():
             return
@@ -3480,6 +3890,7 @@ def process_job(source, text, meta=None):
         _TUI_JOB_ACTIVE.set()
     try:
         injected = isinstance(meta, dict) and meta.get("kind") == "injected_harvest"
+        submitted_to_tui = injected
         path = Path(meta["path"]) if injected and meta.get("path") else newest_transcript_path()
         baseline = int((meta or {}).get("baseline") or 0) if injected else (
             len(read_transcript_rows(path)) if path else 0
@@ -3493,6 +3904,7 @@ def process_job(source, text, meta=None):
                 if path:
                     _tui_inflight_write(_inflight_payload(path, baseline, source, text, prior_path=prior_path))
                 _tui_paste(text, interrupt=False)
+                submitted_to_tui = True
                 path = resolve_active_transcript_path(prior_path, text) or newest_transcript_path() or path
                 # /clear 뒤 새 일기장으로 갈리면 옛 baseline 을 가져가면
                 # wait_for_final 이 이미 적힌 답을 못 본다 (live fire 2026-09-01).
@@ -3526,7 +3938,7 @@ def process_job(source, text, meta=None):
                 pasted_text=text,
                 prior_path=prior_path,
             )
-            if path
+            if path or submitted_to_tui
             else ("", path)
         )
         delivered = _deliver_job_outcome(path, answer, gen)
@@ -3545,7 +3957,7 @@ def process_job(source, text, meta=None):
                 "끝나면 답 이어서 보낼게 (같은 일 두 번 안 시킨다).",
             )
             return
-        if TUI_FALLBACK_HEADLESS and not injected:
+        if TUI_FALLBACK_HEADLESS and not injected and not submitted_to_tui:
             answer = run_headless(text)
             if answer:
                 if _mesh_delivery_sent(deliver_cursor_answer(answer)):
@@ -3601,7 +4013,51 @@ def is_status_command(text):
     return slash_token(text) == "/status"
 
 
+_ACP_BRIDGE = None
+
+
+def acp_enabled():
+    return os.environ.get("CUB_TRANSPORT", "tui") == "acp"
+
+
+def acp_terminal_mirror_loop():
+    scheduled = set()
+    while True:
+        try:
+            acp_bridge().sync_terminal()
+            for path in acp_bridge().pending():
+                if str(path) not in scheduled:
+                    scheduled.add(str(path))
+                    JOBS.put(("acp-recovery", "", {"acp_outbox": str(path)}))
+        except Exception as exc: print(f"{LOG_KEY} ACP terminal mirror: {type(exc).__name__}", file=sys.stderr)
+        time.sleep(3)
+
+
+def acp_bridge():
+    global _ACP_BRIDGE
+    if _ACP_BRIDGE is None:
+        from cursor_acp_bridge import AcpBridge
+        socket_path = os.environ["CUB_ACP_SOCKET"]
+        _ACP_BRIDGE = AcpBridge(socket_path, Path(socket_path).parent / "telegram-outbox",
+                                deliver_mesh_event, CursorFlowCard)
+    return _ACP_BRIDGE
+
+
 def handle_message_text(text, source="telegram", meta=None):
+    if acp_enabled():
+        if is_awaiting_human():
+            if source == "telegram" and not text.strip().startswith("/"):
+                clear_awaiting_human()
+            elif source != "telegram":
+                return
+        if text.strip().startswith("/"):
+            def control():
+                try: acp_bridge().control(text)
+                except Exception as exc: deliver_mesh_event("error", "ACP: " + str(exc))
+            threading.Thread(target=control, daemon=True).start()
+        else:
+            acp_bridge().prepare(text, (meta or {}).get("update_id"))
+        return
     with _TUI_ADMISSION_LOCK:
         return _handle_message_text_locked(text, source, meta)
 
@@ -3636,6 +4092,8 @@ def _handle_message_text_locked(text, source="telegram", meta=None):
     _HARVEST_GEN += 1
     if source == "telegram":
         remember_telegram_origin_prompt(text)
+        # T-260914-021: 주입 즉시 Codex식 받은 지시 카드 (busy/idle 공통).
+        emit_received_directive_card(text)
     busy = maybe_busy_inject_telegram(text, source)
     if busy:
         JOBS.put((source, text, busy))
@@ -3645,17 +4103,34 @@ def _handle_message_text_locked(text, source="telegram", meta=None):
     health_mark(last_enqueue_at=time.time(), enqueued=1)
 
 
+def _relay_after_job_failure(exc):
+    """Recover unacknowledged finals without touching an Approval overlay."""
+    print(f"{LOG_KEY} job 실패: {exc}", file=sys.stderr)
+    harvested = 0
+    try:
+        path = newest_transcript_path()
+        if path:
+            harvested = harvest_orphaned_finals(path)
+    except Exception as recovery_exc:
+        print(f"{LOG_KEY} failure harvest: {type(recovery_exc).__name__}", file=sys.stderr)
+    if harvested:
+        return harvested
+    if "승인 대기" in str(exc) or "키 주입 금지" in str(exc):
+        return 0
+    try:
+        deliver_mesh_event("error", f"커서 브릿지 잡 실패: {exc}")
+    except Exception:
+        pass
+    return 0
+
+
 def worker_loop():
     while True:
         source, text, meta = JOBS.get()
         try:
             process_job(source, text, meta)
         except Exception as exc:  # noqa: BLE001
-            print(f"{LOG_KEY} job 실패: {exc}", file=sys.stderr)
-            try:
-                deliver_mesh_event("error", f"커서 브릿지 잡 실패: {exc}")
-            except Exception:
-                pass
+            _relay_after_job_failure(exc)
         finally:
             JOBS.task_done()
 
@@ -3871,7 +4346,19 @@ def telegram_poller():
             try:
                 callback = upd.get("callback_query")
                 if callback:
-                    handle_telegram_callback(callback)
+                    if acp_enabled():
+                        allowed = str((callback.get("message") or {}).get("chat", {}).get("id")) == str(CHAT_ID)
+                        allowed = allowed and str((callback.get("from") or {}).get("id")) == str(CHAT_ID)
+                        notice = "이 버튼은 현재 ACP 요청에 사용할 수 없습니다."
+                        if allowed and str(callback.get("data", "")).startswith("acp:"):
+                            try:
+                                acp_bridge().callback(callback["data"])
+                                notice = "선택을 전달했습니다."
+                            except Exception:
+                                notice = "요청이 만료됐거나 처리되지 않았습니다."
+                        tg("answerCallbackQuery", callback_query_id=callback.get("id"), text=notice)
+                    else:
+                        handle_telegram_callback(callback)
                     continue
                 text = telegram_prompt_from_update(upd)
                 if not text:
@@ -3879,7 +4366,7 @@ def telegram_poller():
                 inbox_spool(upd.get("update_id"), "telegram", text)
                 preview = text.splitlines()[0][:80]
                 print(f">>> [{NAME}] 텔레그램 cursor: {preview}", flush=True)
-                handle_message_text(text, source="telegram")
+                handle_message_text(text, source="telegram", meta={"update_id": upd.get("update_id")})
             except Exception as exc:  # noqa: BLE001
                 print(f"telegram update 처리 실패: {exc}", file=sys.stderr)
             finally:
@@ -3931,9 +4418,9 @@ def main():
     health_mark(worker_alive=True)
     threading.Thread(target=health_ticker, name="cub-health", daemon=True).start()
     threading.Thread(target=typing_loop, name="cub-typing", daemon=True).start()
-    if TUI_MIRROR_LOCAL:
+    if TUI_MIRROR_LOCAL and not acp_enabled():
         threading.Thread(target=tui_local_mirror_ticker, name="cub-tui-mirror", daemon=True).start()
-    if APPROVAL_SURFACE_ENABLED:
+    if APPROVAL_SURFACE_ENABLED and not acp_enabled():
         threading.Thread(
             target=approval_surface_ticker,
             name="cub-approval-surface",
@@ -3942,6 +4429,10 @@ def main():
     if DRY_RUN:
         return
     drain_pending_updates()
+    if acp_enabled():
+        threading.Thread(target=acp_terminal_mirror_loop, daemon=True).start()
+        telegram_poller()
+        return
     # inflight 회수는 턴이 끝날 때까지 기다린다(연장 포함 최대 TUI_WAIT_MAX_SEC). 메인 스레드에서
     # 돌리면 그동안 getUpdates 가 멈춰 폰에서 /status 조차 안 먹는다 → 스레드로 뺀다.
     # 회수 중엔 _TUI_JOB_ACTIVE 가 켜져 있어 새 텔레그램 글은 평소처럼 busy-inject(follow-up) 로 간다.
