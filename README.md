@@ -288,6 +288,10 @@ rather than dropping it.
   settings, slash commands, and safety behaviors do not carry over.
 - It does not verify Cursor billing. See Settings above.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MIT, matching the sibling bridges.
