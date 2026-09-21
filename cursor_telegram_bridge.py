@@ -129,7 +129,7 @@ TUI_CONTEXT_USED_RE = re.compile(
 )
 DOWNLOAD_ATTEMPT_TIMEOUT = int_env("CUB_DOWNLOAD_TIMEOUT", 30, minimum=5)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-SUGGESTED_REPLY_SPLIT = bool_env("CUB_SUGGESTED_REPLY_SPLIT", True)
+SUGGESTED_REPLY_SPLIT = bool_env("CUB_SUGGESTED_REPLY_SPLIT", False)
 SUGGESTED_CALLBACK_PREFIX = "cub-sr"
 SUGGESTED_BUTTON_TEXT = "확인"
 DEFAULT_SUGGESTED_REPLY = "이어서 해줘"
@@ -278,6 +278,7 @@ HEADLESS_TRANSCRIPTS_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.headl
 SUGGESTED_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.suggested.json")
 MODEL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.model.json")
 APPROVAL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.approval.json")
+CHOICE_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.choice.json")
 API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 
 JOBS: queue.Queue = queue.Queue()
@@ -581,6 +582,8 @@ def _tui_pane_shows_guard_busy(screen):
         return True
     if _tui_pane_shows_approval_overlay(screen):
         return True
+    if _tui_pane_shows_choice_menu(screen):
+        return True
     if _tui_pane_shows_model_picker(screen):
         return True
     tail = "\n".join((screen or "").splitlines()[-16:])
@@ -671,6 +674,81 @@ def _tui_approval_signature(screen):
         return ""
     normalized = "\n".join(line.rstrip() for line in active.splitlines()).strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+
+
+# Letter-key menus: `▶ [a] Approve all` / `[c] Continue without` / hint line.
+_CHOICE_OPTION_RE = re.compile(
+    r"(?:[▶▸]\s*)?\[([A-Za-z])\]\s+(.+?)(?=\s*/\s*\[|$)"
+)
+_CHOICE_HINT_RE = re.compile(
+    r"(?i)(?:use\s+arrow\s+keys|press\s+the\s+key\s+shown|press\s+the\s+(?:letter|key)\b)"
+)
+_CHOICE_MCP_LABEL_RE = re.compile(
+    r"(?i)approve all|continue without|\bquit\b|\ballow\b|\bdeny\b"
+)
+_IDLE_COMPOSE_LINE_RE = re.compile(
+    r"^\s*(?:→|->)\s*(?:add a follow-up|plan,\s*search)\b",
+    re.IGNORECASE,
+)
+
+
+def _tui_parse_choice_options(text):
+    """Parse `[x] label` rows. MVP: MCP/Aside style letter menus, not full-screen UIs."""
+    options = []
+    seen = set()
+    for line in (text or "").splitlines():
+        for match in _CHOICE_OPTION_RE.finditer(line.strip()):
+            key = match.group(1).lower()
+            label = re.sub(r"\s+", " ", match.group(2)).strip(" ·-–—/")
+            if not key or key in seen or len(label) < 2 or label.startswith("/"):
+                continue
+            seen.add(key)
+            options.append({"key": key, "label": label[:60]})
+    return options
+
+
+def _tui_choice_region(screen):
+    """Active overlay text. Do not pick historical `[a]` lines above idle compose."""
+    lines = (screen or "").splitlines()
+    start = 0
+    saw_idle = False
+    for idx, line in enumerate(lines):
+        if _IDLE_COMPOSE_LINE_RE.match(line):
+            start = idx + 1
+            saw_idle = True
+    region = lines[start:] if start else lines
+    text = "\n".join(region)
+    if _tui_parse_choice_options(text) or saw_idle:
+        return text
+    return "\n".join(lines[-24:])
+
+
+def _tui_choice_menu(screen):
+    """Letter-key choice overlay, or None. Tool-approval / model picker stay separate."""
+    if _tui_pane_shows_approval_overlay(screen) or _tui_pane_shows_model_picker(screen):
+        return None
+    text = _tui_choice_region(screen)
+    options = _tui_parse_choice_options(text)
+    if len(options) < 2:
+        return None
+    hinted = bool(_CHOICE_HINT_RE.search(text))
+    pointer = "▶" in text or "▸" in text
+    mcpish = any(_CHOICE_MCP_LABEL_RE.search(item["label"]) for item in options)
+    if not (hinted or pointer or mcpish):
+        return None
+    return {"options": options, "text": text}
+
+
+def _tui_pane_shows_choice_menu(screen):
+    return bool(_tui_choice_menu(screen))
+
+
+def _tui_choice_signature(screen):
+    menu = _tui_choice_menu(screen)
+    if not menu:
+        return ""
+    payload = "|".join(f"{item['key']}:{item['label']}" for item in menu["options"])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
 
 
 def _tui_prompt_visible_in_pane(screen, prompt):
@@ -784,12 +862,14 @@ def _tui_confirm_submit(prompt, path=None):
             return
         overlay = _tui_pane_shows_steer_overlay(screen)
         approval = _tui_pane_shows_approval_overlay(screen)
+        choice = _tui_pane_shows_choice_menu(screen)
         skip = _tui_layout_skip_keys(screen)
         placeholder = _tui_compose_is_placeholder(screen)
         native_slash = _tui_is_native_slash_prompt(prompt)
-        if approval:
+        if approval or choice:
+            kind = "Approval" if approval else "선택"
             print(
-                f"{LOG_KEY} Approval 오버레이 — 키 생략 ({attempt}/{retries})",
+                f"{LOG_KEY} {kind} 오버레이 — 키 생략 ({attempt}/{retries})",
                 file=sys.stderr,
             )
         elif native_slash and not placeholder:
@@ -840,9 +920,12 @@ def _tui_confirm_submit(prompt, path=None):
     stuck = _tui_prompt_visible_in_pane(screen, prompt)
     overlay = _tui_pane_shows_steer_overlay(screen)
     approval = _tui_pane_shows_approval_overlay(screen)
+    choice = _tui_pane_shows_choice_menu(screen)
     started = _tui_repl_shows_turn_started(screen)
     if approval:
         raise RuntimeError("TUI 승인 대기 중 — 키 주입 금지")
+    if choice:
+        raise RuntimeError("TUI 선택 대기 중 — 키 주입 금지")
     if not stuck and _tui_prompt_queued_in_followups(screen, prompt):
         # 큐에 선 글은 지금 턴이 끝나면 TUI 가 스스로 돌린다. 실패가 아니다.
         print(
@@ -1633,6 +1716,69 @@ def _reset_identity():
     return _tmux_pane_pid(), _pane_owned_chat_ids()
 
 
+def _reset_identity_wait(timeout=None, interval=None):
+    """Retry live pane pid + owned chat ids while the pane is alive.
+
+    After overnight Ctrl+C and `--resume`, lsof often misses store.db for a
+    couple of seconds. Do not treat the first empty/unknown snapshot as fatal.
+    Mid-reset comparisons still use a single `_reset_identity()` snapshot.
+    """
+    timeout = RESET_IDENTITY_RETRY_SEC if timeout is None else float(timeout)
+    interval = RESET_IDENTITY_RETRY_INTERVAL if interval is None else float(interval)
+    timeout = max(0.0, timeout)
+    interval = max(0.05, interval)
+    deadline = time.monotonic() + timeout
+    attempts = max(1, int(timeout / interval) + 1)
+    pid, ids = None, None
+    for attempt in range(attempts):
+        pid, ids = _reset_identity()
+        if pid and ids:
+            return pid, ids
+        if not pid and not tui_session_alive():
+            return pid, ids
+        if pid and ids == set() and _reset_empty_session(_tui_capture_pane(), ids):
+            return pid, ids
+        if attempt + 1 >= attempts or time.monotonic() >= deadline:
+            return pid, ids
+        time.sleep(interval)
+    return pid, ids
+
+
+def _reset_user_error_text(exc):
+    """Korean, actionable /clear|/new failure text for Telegram."""
+    text = str(exc or "").strip()
+    if not text:
+        return RESET_IDENTITY_UNKNOWN_MSG
+    if text in {tui_dead_message(), RESET_IDENTITY_UNKNOWN_MSG, RESET_IDENTITY_EMPTY_STORE_MSG}:
+        return text
+    if "식별 불가" in text or "세션 식별" in text:
+        return RESET_IDENTITY_UNKNOWN_MSG
+    if text.startswith("/clear") or text.startswith("커서"):
+        return text
+    return f"/clear 보류: {text}"
+
+
+def _deliver_user_reset_error(exc):
+    """User-initiated /clear|/new must not fail silently (mesh URLError included)."""
+    body = _reset_user_error_text(exc)
+    last = {}
+    for attempt in range(3):
+        try:
+            last = deliver_mesh_event("error", body) or {}
+        except Exception as send_exc:  # noqa: BLE001
+            print(
+                f"{LOG_KEY} reset error mesh 실패 ({attempt + 1}/3): {send_exc}",
+                file=sys.stderr,
+            )
+            last = {}
+        if _mesh_delivery_sent(last):
+            return last
+        if attempt < 2:
+            time.sleep(0.3)
+    print(f"{LOG_KEY} reset error still undelivered: {body}", file=sys.stderr)
+    return last
+
+
 def _reset_journal_write(record, phase, **fields):
     record.update(fields, phase=phase, updated_at=time.time())
     _tui_json_save(_reset_journal_path(), record)
@@ -1659,7 +1805,7 @@ def _tui_verified_reset(source):
     key and refuse to delete changed input or send keys into an active turn.
     """
     previous = _tui_json_load(_reset_journal_path()) or {}
-    before_pid, before_ids = _reset_identity()
+    before_pid, before_ids = _reset_identity_wait()
     screen = _tui_capture_pane()
     if previous.get("phase") in {"prepared", "pasted", "submitted", "unknown"}:
         if (before_pid == previous.get("pid") and _reset_empty_session(screen, before_ids)
@@ -1670,8 +1816,12 @@ def _tui_verified_reset(source):
     if before_pid and _reset_empty_session(screen, before_ids):
         _reset_journal_write({"pid": before_pid, "source": source}, "confirmed", confirmation="already_empty")
         return True
-    if not before_pid or not before_ids:
-        raise RuntimeError("/clear 전 현재 Cursor 세션 식별 불가")
+    if not before_pid:
+        raise RuntimeError(tui_dead_message())
+    if before_ids is None:
+        raise RuntimeError(RESET_IDENTITY_UNKNOWN_MSG)
+    if before_ids == set():
+        raise RuntimeError(RESET_IDENTITY_EMPTY_STORE_MSG)
     if not _reset_screen_safe(_tui_capture_pane()):
         raise RuntimeError("작업 중이거나 입력칸이 비어 있지 않아 /clear 보류")
     record = {"source": source, "pane": TMUX_PANE, "pid": before_pid,
@@ -1742,7 +1892,7 @@ def _handle_tui_reset_locked(source):
         return False
     if not tui_session_alive():
         if not auto:
-            deliver_mesh_event("error", tui_dead_message())
+            _deliver_user_reset_error(tui_dead_message())
         return False
     # No queue/harvest/awaiting-human mutation until Cursor confirms reset.
     try:
@@ -1750,7 +1900,7 @@ def _handle_tui_reset_locked(source):
     except Exception as exc:
         print(f"{LOG_KEY} reset not confirmed: {exc}", file=sys.stderr)
         if not auto:
-            deliver_mesh_event("error", str(exc))
+            _deliver_user_reset_error(exc)
         else:
             rec = _tui_json_load(_reset_journal_path()) or {}
             if rec.get("phase") == "unknown" and not rec.get("notified"):
@@ -1855,6 +2005,8 @@ def _tui_pane_shows_running_stop_cue(screen):
     """
     if _tui_pane_shows_approval_overlay(screen):
         return False
+    if _tui_pane_shows_choice_menu(screen):
+        return False
     if _tui_pane_shows_model_picker(screen):
         return False
     if _tui_repl_shows_turn_started(screen):
@@ -1909,6 +2061,8 @@ def _tui_paste_unlocked(prompt, *, interrupt=False):
             raise RuntimeError("context-guard: state changed before paste")
     if _tui_pane_shows_approval_overlay(screen):
         raise RuntimeError("TUI 승인 대기 중 — 키 주입 금지")
+    if _tui_pane_shows_choice_menu(screen):
+        raise RuntimeError("TUI 선택 대기 중 — 키 주입 금지")
     if interrupt:
         if _tui_pane_shows_running_stop_cue(screen):
             print(f"{LOG_KEY} busy stop — Ctrl+C 후 paste", file=sys.stderr)
@@ -1917,6 +2071,8 @@ def _tui_paste_unlocked(prompt, *, interrupt=False):
             screen = _tui_capture_pane()
             if _tui_pane_shows_approval_overlay(screen):
                 raise RuntimeError("TUI 승인 대기 중 — 키 주입 금지")
+            if _tui_pane_shows_choice_menu(screen):
+                raise RuntimeError("TUI 선택 대기 중 — 키 주입 금지")
         else:
             print(f"{LOG_KEY} interrupt 요청이지만 stop cue 없음 — C-c 생략", file=sys.stderr)
     if _tui_is_native_slash_prompt(payload):
@@ -3246,10 +3402,177 @@ def approval_surface_ticker():
         except Exception as exc:  # noqa: BLE001
             print(f"{LOG_KEY} approval 감시 실패: {exc}", file=sys.stderr)
         try:
+            surface_tui_choice_menu()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{LOG_KEY} choice 감시 실패: {exc}", file=sys.stderr)
+        try:
             surface_tui_model_picker()
         except Exception as exc:  # noqa: BLE001
             print(f"{LOG_KEY} model 피커 감시 실패: {exc}", file=sys.stderr)
         time.sleep(APPROVAL_POLL_INTERVAL)
+
+
+def _read_choice_store():
+    try:
+        with open(CHOICE_STORE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_choice_store(store):
+    tmp = CHOICE_STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(store, fh, ensure_ascii=False)
+    os.replace(tmp, CHOICE_STORE_FILE)
+
+
+def clear_choice_store():
+    try:
+        os.unlink(CHOICE_STORE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def choice_menu_markup(cid, options):
+    rows = []
+    for item in options or []:
+        key = str(item.get("key") or "").strip().lower()
+        label = str(item.get("label") or key).strip()
+        if not key:
+            continue
+        rows.append(
+            [
+                {
+                    "text": f"[{key}] {label}"[:64],
+                    "callback_data": f"{CHOICE_CALLBACK_PREFIX}:{cid}:{key}"[:64],
+                }
+            ]
+        )
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def choice_done_markup(options, chosen=""):
+    rows = []
+    for item in options or []:
+        key = str(item.get("key") or "").strip().lower()
+        label = str(item.get("label") or key).strip()
+        if not key:
+            continue
+        mark = "✅ " if key == chosen else ""
+        rows.append(
+            [
+                {
+                    "text": f"{mark}[{key}] {label}"[:64],
+                    "callback_data": CHOICE_DONE_CALLBACK,
+                }
+            ]
+        )
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def mark_choice_pressed(chat_id, message_id, options, chosen):
+    if not chat_id or not message_id:
+        return
+    try:
+        res = tg(
+            "editMessageReplyMarkup",
+            timeout=10,
+            chat_id=chat_id,
+            message_id=int(message_id),
+            reply_markup=choice_done_markup(options, chosen),
+        )
+        if not res or not res.get("ok"):
+            print(f"{LOG_KEY} choice button mark 실패: {res}", file=sys.stderr)
+    except (TypeError, ValueError, Exception) as exc:  # noqa: BLE001
+        print(f"{LOG_KEY} choice button mark 실패: {exc}", file=sys.stderr)
+
+
+def surface_tui_choice_menu():
+    """Letter-key overlay 하나당 Telegram 버튼을 정확히 한 번 노출한다."""
+    if not CHOICE_SURFACE_ENABLED or not tui_session_alive():
+        return 0
+    screen = _tui_capture_pane()
+    menu = _tui_choice_menu(screen)
+    signature = _tui_choice_signature(screen)
+    if not menu or not signature:
+        clear_choice_store()
+        return 0
+    current = _read_choice_store()
+    if current.get("signature") == signature and current.get("cid"):
+        return 0
+    cid = uuid.uuid4().hex[:12]
+    labels = ", ".join(f"[{item['key']}] {item['label']}" for item in menu["options"])
+    result = deliver_mesh_event(
+        "report",
+        f"Cursor 선택 화면이 떴어. 버튼을 누르면 해당 키를 넣을게.\n{labels}",
+        reply_markup=choice_menu_markup(cid, menu["options"]),
+    )
+    if not _mesh_delivery_sent(result):
+        return 0
+    _write_choice_store(
+        {
+            "cid": cid,
+            "signature": signature,
+            "options": menu["options"],
+            "message_id": _first_sent_message_id(result),
+            "ts": time.time(),
+        }
+    )
+    print(f"{LOG_KEY} choice 버튼 노출 {labels}", flush=True)
+    return 1
+
+
+def handle_choice_callback(data, answer, message=None):
+    if data == CHOICE_DONE_CALLBACK:
+        answer()
+        return
+    prefix = f"{CHOICE_CALLBACK_PREFIX}:"
+    if not data.startswith(prefix):
+        answer("알 수 없는 버튼이야")
+        return
+    rest = data[len(prefix) :]
+    cid, sep, key = rest.partition(":")
+    key = key.strip().lower()
+    current = _read_choice_store()
+    if not current or cid != str(current.get("cid") or "") or not key:
+        answer("만료된 선택 버튼이야")
+        return
+    if current.get("handled"):
+        answer("이미 처리한 선택 버튼이야")
+        return
+    if not tui_session_alive():
+        clear_choice_store()
+        answer("커서 창이 꺼져 있어")
+        return
+    screen = _tui_capture_pane()
+    signature = _tui_choice_signature(screen)
+    if not signature or signature != str(current.get("signature") or ""):
+        clear_choice_store()
+        answer("선택 화면이 이미 닫혔거나 바뀌었어")
+        return
+    allowed = {str(item.get("key") or "").lower() for item in (current.get("options") or [])}
+    if key not in allowed:
+        answer("이 화면에 없는 선택이야")
+        return
+    proc = _tmux("send-keys", "-t", TMUX_PANE, "-l", key)
+    if getattr(proc, "returncode", 0) not in (0, None):
+        answer("선택 키 주입에 실패했어")
+        return
+    answer(f"[{key}] 선택했어")
+    mid = message.get("message_id") if isinstance(message, dict) else None
+    mark_choice_pressed(
+        CHAT_ID,
+        mid or current.get("message_id"),
+        current.get("options") or [],
+        key,
+    )
+    current["handled"] = True
+    current["handled_key"] = key
+    current["handled_at"] = time.time()
+    _write_choice_store(current)
+    print(f"{LOG_KEY} choice [{key}] 선택", flush=True)
 
 
 # ── /model — Cursor TUI 모델 피커를 폰에서 고른다 ─────────────────────────────
@@ -3359,6 +3682,8 @@ def tui_select_model(target):
     screen = _tui_capture_pane()
     if _tui_pane_shows_approval_overlay(screen):
         return False, "승인 화면이 떠 있어 — 먼저 처리해줘"
+    if _tui_pane_shows_choice_menu(screen):
+        return False, "선택 화면이 떠 있어 — 먼저 처리해줘"
     if _tui_pane_shows_model_picker(screen):
         # 터미널에서 연 피커가 떠 있으면 닫고 팔레트 인자형으로 간다(피커 타이핑은 키를 삼킨다).
         _tui_close_model_picker()
@@ -3640,7 +3965,7 @@ def mark_suggested_pressed(chat_id, message_id):
 
 
 def handle_telegram_callback(callback):
-    """추천답변 칩 또는 현재 Approval의 Run Everything 버튼."""
+    """추천답변 칩, Approval Run Everything, 또는 letter-key 선택 버튼."""
     cb = callback if isinstance(callback, dict) else {}
     qid = str(cb.get("id") or "")
     message = cb.get("message") if isinstance(cb.get("message"), dict) else {}
@@ -3660,6 +3985,9 @@ def handle_telegram_callback(callback):
     data = str(cb.get("data") or "")
     if data.startswith(f"{MODEL_CALLBACK_PREFIX}:"):
         handle_model_callback(data, answer, message)
+        return
+    if data.startswith(f"{CHOICE_CALLBACK_PREFIX}:"):
+        handle_choice_callback(data, answer, message)
         return
     approval_prefix = f"{APPROVAL_CALLBACK_PREFIX}:"
     if data.startswith(approval_prefix):
@@ -3721,6 +4049,7 @@ def split_suggested_reply(text):
     """Split a trailing suggestion marker into (body, suggestion).
 
     Only a marker at the very end of the answer is a suggestion.
+    When CUB_SUGGESTED_REPLY_SPLIT is off, drop the tag and send body only.
     """
     raw = text or ""
     stripped = raw.rstrip()
@@ -3736,6 +4065,8 @@ def split_suggested_reply(text):
     body = stripped[:open_at].rstrip()
     if not reply or not body:
         return raw, ""
+    if not SUGGESTED_REPLY_SPLIT:
+        return body, ""
     return body, reply
 
 
@@ -3770,10 +4101,8 @@ def deliver_cursor_answer(text, task_id=None):
     없는 답에는 추천 문구를 합성하지 않는다(Claude·Grok 동일).
     """
     text = strip_trailing_reasoning(text)
-    body, suggested = (
-        split_suggested_reply(text) if SUGGESTED_REPLY_SPLIT else (text, "")
-    )
-    if not suggested:
+    body, suggested = split_suggested_reply(text)
+    if SUGGESTED_REPLY_SPLIT and not suggested:
         body = text or body
     body, copy_bubbles = split_copy_content(body)
     copy_bubbles = [c for c in copy_bubbles if not _copy_bubble_is_dump(c)]

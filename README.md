@@ -288,22 +288,18 @@ rather than dropping it.
   settings, slash commands, and safety behaviors do not carry over.
 - It does not verify Cursor billing. See Settings above.
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
 ## License
 
 MIT, matching the sibling bridges.
 
 ### Suggested follow-ups: on/off
 
-`CUB_SUGGESTED_TAIL_PROMPT=1` (default) asks for a useful optional next request
-on ordinary Telegram prompts. Set it to `0` and restart the bridge to stop adding
-that instruction. Slash commands and direct terminal input remain unchanged.
-Keep `CUB_SUGGESTED_REPLY_SPLIT=1` to render any model-produced tag as a final
-suggestion bubble with **확인** (Confirm). Turning SPLIT off leaves raw markers
-in answers; it does not disable generation.
+`CUB_SUGGESTED_TAIL_PROMPT=1` asks for a useful optional next request
+on ordinary Telegram prompts. Default is `0` (off; T-260914-016 / #2120). Restart the
+bridge after changing it. Slash commands and direct terminal input remain unchanged.
+`CUB_SUGGESTED_REPLY_SPLIT` defaults to off (`0`). Set `1` to render a model-produced
+tag as a suggestion bubble with **확인** (Confirm). When off, the tag is removed
+from the answer body and no confirm chip is sent.
 
 Confirm pastes and submits the suggestion to Cursor; it does not merely copy to
 the clipboard. The button changes to **✅ 보냄** and repeated clicks do not resend.
