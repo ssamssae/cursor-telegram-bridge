@@ -93,18 +93,47 @@ class PublicExportTest(unittest.TestCase):
         self.assertFalse(mod.tail_is_busy(rows))
         self.assertTrue(mod.turn_has_ended(rows))
 
-    def test_trailing_suggested_reply_is_split(self):
-        mod = load_bridge("cub_suggested")
+    def test_trailing_suggested_reply_defaults_off(self):
+        mod = load_bridge("cub_suggested_off")
         open_m = "<" + "추천답변" + ">"
         close_m = "</" + "추천답변" + ">"
+        self.assertFalse(mod.SUGGESTED_REPLY_SPLIT)
+        self.assertEqual(
+            mod.split_suggested_reply("hello\n" + open_m + "yes" + close_m),
+            ("hello", ""),
+        )
+        self.assertEqual(mod.split_suggested_reply("hello"), ("hello", ""))
+
+    def test_trailing_suggested_reply_is_split(self):
+        mod = load_bridge("cub_suggested", CUB_SUGGESTED_REPLY_SPLIT="1")
+        open_m = "<" + "추천답변" + ">"
+        close_m = "</" + "추천답변" + ">"
+        self.assertTrue(mod.SUGGESTED_REPLY_SPLIT)
         self.assertEqual(
             mod.split_suggested_reply("hello\n" + open_m + "yes" + close_m),
             ("hello", "yes"),
         )
         self.assertEqual(mod.split_suggested_reply("hello"), ("hello", ""))
 
+    def test_suggested_reply_default_off_sends_body_only(self):
+        mod = load_bridge("cub_suggested_off_send")
+        mod.DRY_RUN = False
+        calls = []
+        with mock.patch.object(
+            mod,
+            "tg",
+            lambda method, timeout=60, **params: calls.append((method, params))
+            or {"ok": True, "result": {"message_id": len(calls)}},
+        ):
+            open_m = "<" + "추천답변" + ">"
+            close_m = "</" + "추천답변" + ">"
+            mod.deliver_cursor_answer("본문\n" + open_m + "이어서 해줘" + close_m)
+        self.assertEqual([c[0] for c in calls], ["sendMessage"])
+        self.assertEqual(calls[0][1]["text"], "본문")
+        self.assertNotIn("reply_markup", calls[0][1])
+
     def test_suggested_reply_sends_confirm_button(self):
-        mod = load_bridge("cub_suggested_button")
+        mod = load_bridge("cub_suggested_button", CUB_SUGGESTED_REPLY_SPLIT="1")
         mod.DRY_RUN = False
         calls = []
         with mock.patch.object(
