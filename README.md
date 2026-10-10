@@ -1,6 +1,6 @@
 # Cursor Telegram Bridge
 
-[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://ssamssae.github.io/cursor-telegram-bridge/) · [Web verification](docs/feature-map.md)
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/cursor-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
 Text your own private Telegram bot, and the message runs as a Cursor turn on
 your computer. Cursor's finished answer comes back to your phone.
