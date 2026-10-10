@@ -62,6 +62,26 @@ class PublicExportTest(unittest.TestCase):
         self.assertEqual(calls[0][1]["text"], "hello")
         self.assertEqual(result["deliveries"][0]["message_id"], 7)
 
+    def test_final_dedup_is_scoped_to_the_same_turn(self):
+        mod = load_bridge("cub_final_scope")
+        mod.DRY_RUN = False
+        with mock.patch.object(mod, "tg", return_value={"ok": True, "result": {"message_id": 7}}) as send:
+            mod.deliver_mesh_event("final", "same answer", final_scope="turn-a")
+            duplicate = mod.deliver_mesh_event("final", "same answer", final_scope="turn-a")
+            mod.deliver_mesh_event("final", "same answer", final_scope="turn-b")
+        self.assertEqual(duplicate["result"], "skipped_duplicate")
+        self.assertEqual(send.call_count, 2)
+
+    def test_failed_final_can_be_retried(self):
+        mod = load_bridge("cub_final_retry")
+        mod.DRY_RUN = False
+        with mock.patch.object(mod, "tg", side_effect=[{"ok": False}, {"ok": True, "result": {"message_id": 7}}]) as send:
+            failed = mod.deliver_mesh_event("final", "retry answer", final_scope="turn-a")
+            retried = mod.deliver_mesh_event("final", "retry answer", final_scope="turn-a")
+        self.assertEqual(failed["deliveries"][0]["result"], "failed")
+        self.assertEqual(retried["deliveries"][0]["result"], "sent")
+        self.assertEqual(send.call_count, 2)
+
     def test_long_answer_is_chunked_under_the_telegram_cap(self):
         mod = load_bridge("cub_chunking")
         mod.DRY_RUN = False
@@ -151,8 +171,7 @@ class PublicExportTest(unittest.TestCase):
         self.assertNotIn("reply_markup", calls[0][1])
         self.assertEqual(calls[1][1]["text"], "이어서 해줘")
         markup = calls[1][1]["reply_markup"]
-        self.assertIn("확인", markup)
-        self.assertEqual(json.loads(markup)["inline_keyboard"][0][0]["text"], "확인")
+        self.assertEqual(json.loads(markup)["inline_keyboard"][0][0]["text"], "Send")
         self.assertEqual(len(json.loads(markup)["inline_keyboard"][0]), 1)
         self.assertIn("cub-sr", markup)
 

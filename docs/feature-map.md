@@ -24,3 +24,9 @@ Public hosting is a separate verification step: after publishing, repeat the lan
 로컬 설명서를 열어 상단 언어 메뉴 → 본문·목차 즉시 변경 → 새로고침 뒤 선택 유지 → `?lang=ko` 직접 진입을 확인합니다.
 390px 화면에서 메뉴·본문이 잘리지 않는지 확인하고, 공개 게시 후에도 실제 HTTPS 주소에서 같은 순서로 확인합니다.
 로컬 확인만으로 공개 게시나 설치된 브릿지 동작을 완료로 판단하지 않습니다.
+
+## Release 0.4.5 verification
+
+Public export and regression suite: 24 tests (4 other-engine skips). Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
+Final-delivery regressions cover the same text in different turns and a retry after a failed send.
+GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.

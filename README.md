@@ -9,7 +9,7 @@ This bridge is Cursor-specific. It is a sibling of the [Claude Telegram
 Bridge](https://github.com/ssamssae/claude-telegram-bridge), the [Codex Telegram
 Bridge](https://github.com/ssamssae/codex-telegram-bridge), and the [Grok
 Telegram Bridge](https://github.com/ssamssae/grok-telegram-bridge), but it does
-not share runtime code with any of them.
+not share sessions or credentials with any of them.
 
 ## Read This First
 
@@ -296,9 +296,9 @@ MIT, matching the sibling bridges.
 
 ### Suggested follow-ups: on/off
 
-`CUB_SUGGESTED_TAIL_PROMPT=1` asks for a useful optional next request
-on ordinary Telegram prompts. Default is `0` (off; T-260914-016 / #2120). Restart the
-bridge after changing it. Slash commands and direct terminal input remain unchanged.
+Suggested-reply generation instructions and per-message reply-style reminders
+are no longer appended. The retired `CUB_SUGGESTED_TAIL_PROMPT` setting has no
+effect, including when set to `1`. Legacy suffixes are stripped from retried input.
 `CUB_SUGGESTED_REPLY_SPLIT` defaults to off (`0`). Set `1` to render a model-produced
 tag as a suggestion bubble with **확인** (Confirm). When off, the tag is removed
 from the answer body and no confirm chip is sent.
@@ -306,4 +306,14 @@ from the answer body and no confirm chip is sent.
 Confirm pastes and submits the suggestion to Cursor; it does not merely copy to
 the clipboard. The button changes to **✅ 보냄** and repeated clicks do not resend.
 Clear invalidates old buttons. No useful next action means no suggestion is required.
-Older builds ignored the generation switch; this build honors both values.
+Existing conversation history and direct terminal input are not rewritten.
+
+## Interface language
+
+Use `/language en` or `/language ko` in your configured Telegram chat; `/language`
+shows the current setting. The selection persists after restart. Public installs
+default to English. Bridge instructions, notices and controls are localized;
+your prompts, AI answers, option text and model identifiers remain unchanged.
+
+For the initial setting, use `CUB_LANGUAGE=en` or `CUB_LANGUAGE=ko`.
+See [language settings and verification](docs/i18n.md) for precedence and coverage.
