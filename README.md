@@ -2,6 +2,10 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/cursor-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
+![The family of four Telegram bridges: Claude, Codex, Grok, and Cursor, by ssamssae](docs/assets/tgbridges_card.jpg)
+
+[Claude Telegram Bridge](https://github.com/ssamssae/claude-telegram-bridge) · [Codex Telegram Bridge](https://github.com/ssamssae/codex-telegram-bridge) · [Grok Telegram Bridge](https://github.com/ssamssae/grok-telegram-bridge) · [Cursor Telegram Bridge](https://github.com/ssamssae/cursor-telegram-bridge)
+
 Text your own private Telegram bot, and the message runs as a Cursor turn on
 your computer. Cursor's finished answer comes back to your phone.
 
