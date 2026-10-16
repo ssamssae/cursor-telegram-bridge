@@ -164,6 +164,46 @@ SUGGESTED_SURFACE = "direct"
 SUGGESTED_SPLIT_LOG_KEY = "cub_suggested_split"
 SUGGESTED_OPEN = "<" + "추천답변" + ">"
 SUGGESTED_CLOSE = "</" + "추천답변" + ">"
+# Public controls retained from the generated source.
+CUB_FLOW_MIRROR_ENV = "CUB_FLOW_MIRROR"
+CUB_FLOW_MIRROR_FLAG = os.path.join(STATE_DIR, "cursor-bridge-flow-mirror.on")
+CUB_FLOW_MIRROR_DETAIL_ENV = "CUB_FLOW_MIRROR_DETAIL"
+CUB_FLOW_MIRROR_DETAIL_FLAG = os.path.join(STATE_DIR, "cursor-bridge-flow-mirror-detail.on")
+APPROVAL_CALLBACK_PREFIX = "cub-approval"
+APPROVAL_BUTTON_TEXT = "▶ Run Everything"
+APPROVAL_DONE_BUTTON_TEXT = "✅ Run Everything"
+APPROVAL_DONE_CALLBACK = f"{APPROVAL_CALLBACK_PREFIX}:done"
+APPROVAL_SURFACE_ENABLED = bool_env("CUB_APPROVAL_SURFACE", True)
+APPROVAL_POLL_INTERVAL = float_env("CUB_APPROVAL_POLL_INTERVAL", 1.0)
+CHOICE_CALLBACK_PREFIX = "cub-choice"
+CHOICE_DONE_CALLBACK = f"{CHOICE_CALLBACK_PREFIX}:done"
+CHOICE_SURFACE_ENABLED = bool_env("CUB_CHOICE_SURFACE", True)
+RESET_IDENTITY_RETRY_SEC = float_env("CUB_RESET_IDENTITY_RETRY_SEC", 2.5)
+RESET_IDENTITY_RETRY_INTERVAL = float_env("CUB_RESET_IDENTITY_RETRY_INTERVAL", 0.4)
+RESET_IDENTITY_UNKNOWN_MSG = (
+    "/clear 보류: Cursor 세션을 식별하지 못했습니다. 커서 창을 확인하거나 브릿지를 재시작한 뒤 다시 보내 주세요."
+)
+RESET_IDENTITY_EMPTY_STORE_MSG = (
+    "/clear 보류: 화면은 비어 있지 않은데 열린 Cursor 채팅 store 가 없습니다. "
+    "커서 창을 확인하거나 브릿지를 재시작한 뒤 다시 보내 주세요."
+)
+MODEL_CALLBACK_PREFIX = "cub-model"
+MODEL_CLOSE_CALLBACK = f"{MODEL_CALLBACK_PREFIX}:close"
+MODEL_PAGE_CALLBACK = f"{MODEL_CALLBACK_PREFIX}:page"
+MODEL_MENU = tuple(
+    m.strip()
+    for m in env(
+        "CUB_MODEL_MENU",
+        "Claude Fable 5.1,Claude Opus 5,GPT-5.6 Sol,GPT-5.5,Composer 2.5,"
+        "Claude Fable 5,Claude Opus 4.8,Cursor Grok 4.6,Cursor Grok 4.5,Gemini 3.8 Flash,Gemini 3.7 Flash",
+    ).split(",")
+    if m.strip()
+)
+MODEL_MENU_COLUMNS = int_env("CUB_MODEL_MENU_COLUMNS", 2)
+MODEL_PAGE_SIZE = int_env("CUB_MODEL_PAGE_SIZE", 12)
+MODEL_KEY_DELAY = float_env("CUB_MODEL_KEY_DELAY", 0.12)
+MODEL_PICKER_WAIT = float_env("CUB_MODEL_PICKER_WAIT", 4.0)
+MODEL_SURFACE_ENABLED = bool_env("CUB_MODEL_SURFACE", True)
 SUGGESTED_TAIL_PROMPT = False
 SUGGESTED_OPEN = "<" + "추천답변" + ">"
 SUGGESTED_CLOSE = "</" + "추천답변" + ">"
@@ -5071,6 +5111,8 @@ def typing_loop():
 
 
 def main():
+    if os.environ.get("CUB_TRANSPORT", "tui") != "tui":
+        sys.exit("Public bridge supports only CUB_TRANSPORT=tui; IDE/ACP adapters are not bundled.")
     print(
         f"{LOG_KEY} start name={NAME} node={NODE_KEY} session={TMUX_SESSION} "
         f"dry={int(DRY_RUN)} mirror={int(TUI_MIRROR_LOCAL)} "
@@ -5093,7 +5135,6 @@ def main():
         ).start()
     if DRY_RUN:
         return
-    threading.Thread(target=ide_bridge().mirror_loop, name="cub-ide-mirror", daemon=True).start()
     drain_pending_updates()
     if ide_enabled():
         telegram_poller()
