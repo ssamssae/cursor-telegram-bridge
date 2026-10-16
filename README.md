@@ -317,3 +317,7 @@ your prompts, AI answers, option text and model identifiers remain unchanged.
 
 For the initial setting, use `CUB_LANGUAGE=en` or `CUB_LANGUAGE=ko`.
 See [language settings and verification](docs/i18n.md) for precedence and coverage.
+
+## Startup verification
+
+See [startup checks and supported transport](docs/feature-map.md).
