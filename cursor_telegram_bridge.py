@@ -2739,9 +2739,12 @@ class CursorFlowCard:
     the turn, and a failed edit never falls back to a new message.
     """
 
-    def __init__(self, started, title="", *, stoppable=False, gen=None):
+    def __init__(self, started, title="", *, stoppable=False, gen=None, ambient=False):
         global _ACTIVE_FLOW_CARD
         self.started = started
+        # T-261107-014: a turn typed in the tmux pane owns its own card; the stop
+        # callback checks the terminal turn (busy) instead of the Telegram job.
+        self.ambient = bool(ambient)
         self.title = cursor_flow_title(title)
         self.message_id = None
         self.attempted = False
@@ -2932,6 +2935,17 @@ def turn_was_aborted(rows):
     return False
 
 
+def _stop_turn_running(card):
+    """A phone job owns the running turn; a terminal card only while that turn is busy.
+
+    T-261107-014: the phone-started job keeps precedence — while it runs, a press on
+    a terminal card is refused like an ended request.
+    """
+    if _TUI_JOB_ACTIVE.is_set():
+        return not getattr(card, "ambient", False)
+    return bool(getattr(card, "ambient", False)) and _TUI_TURN_BUSY.is_set()
+
+
 def handle_stop_callback(data, answer, message, sender):
     token = data[len(STOP_CALLBACK_PREFIX) + 1:]
     with _ACTIVE_FLOW_LOCK:
@@ -2940,7 +2954,7 @@ def handle_stop_callback(data, answer, message, sender):
             or str(message.get("message_id")) != str(card.message_id)
             or str((sender or {}).get("id")) != str(CHAT_ID)
             or (card.gen is not None and card.gen != _HARVEST_GEN)
-            or not _TUI_JOB_ACTIVE.is_set()):
+            or not _stop_turn_running(card)):
         answer(tr("이미 끝난 요청입니다."))
         return
     if card.stop_state:
@@ -3752,6 +3766,62 @@ def _mirror_prompt_body(question):
 
 
 
+# T-261107-014: 터미널(앰비언트)에서 시작한 턴의 진행 카드. 폰 턴 카드와 같은 CursorFlowCard
+# 라 중지 버튼도 같다. 텔레그램 잡이 돌면 그쪽 카드가 우선이고(이 카드는 「다음 카드로
+# 이어짐」으로 닫힌다), 배차(handoff) 카드가 살아 있으면 종전대로 그 카드만 갱신한다.
+_AMBIENT_FLOW_CARD = None
+_AMBIENT_FLOW_KEY = ""
+
+
+def _ambient_flow_key(path, rows):
+    idx = max((i for i, row in enumerate(rows or []) if row.get("role") == "user"), default=-1)
+    return f"{path}:{idx}", idx
+
+
+def _ambient_card_close(status):
+    global _AMBIENT_FLOW_CARD, _AMBIENT_FLOW_KEY
+    card, _AMBIENT_FLOW_CARD, _AMBIENT_FLOW_KEY = _AMBIENT_FLOW_CARD, None, ""
+    if card is not None and not card.closed:
+        try:
+            card.update(status=status)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{LOG_KEY} terminal card close failed: {exc}", file=sys.stderr)
+
+
+def _ambient_card_open(path, rows, question):
+    """Open (or keep) the card for the terminal-started turn that is running now."""
+    global _AMBIENT_FLOW_CARD, _AMBIENT_FLOW_KEY
+    key, _idx = _ambient_flow_key(path, rows)
+    if _AMBIENT_FLOW_CARD is not None and _AMBIENT_FLOW_KEY != key:
+        _ambient_card_close("handover")
+    if _AMBIENT_FLOW_CARD is None:
+        if not question or not cursor_flow_enabled() or is_telegram_origin_prompt(question):
+            return None
+        _AMBIENT_FLOW_CARD = CursorFlowCard(time.time(), question, stoppable=True, ambient=True)
+        _AMBIENT_FLOW_KEY = key
+    return _AMBIENT_FLOW_CARD
+
+
+def _ambient_card_progress(path, rows, question, open_index):
+    card = _ambient_card_open(path, rows, question)
+    if card is None:
+        return
+    turn_rows = rows[open_index:] if open_index is not None and open_index >= 0 else rows
+    stage = cursor_progress_sentence(turn_rows)
+    if stage:
+        card.update(stage)
+    card.tick()
+
+
+def _ambient_card_settle(rows):
+    """The terminal turn is no longer busy: close its card the way the phone card closes."""
+    if _AMBIENT_FLOW_CARD is None:
+        return
+    _key, idx = _ambient_flow_key(_AMBIENT_FLOW_KEY.rsplit(":", 1)[0], rows)
+    turn_rows = rows[idx:] if idx >= 0 else rows
+    _ambient_card_close("interrupt" if turn_was_aborted(turn_rows) else "sent")
+
+
 def mirror_local_tui_turns():
     """tmux 창에 직접 친 턴을 폰으로 올린다. 그록 GRB_TUI_MIRROR_LOCAL 동형.
 
@@ -3764,6 +3834,7 @@ def mirror_local_tui_turns():
     path = newest_transcript_path()
     if not path:
         _TUI_TURN_BUSY.clear()
+        _ambient_card_close("cancelled")
         return 0
     with _HARVEST_LOCK:
         rows = read_transcript_rows(path)
@@ -3773,6 +3844,8 @@ def mirror_local_tui_turns():
         if open_q and emit_prompt_mirror_once(open_q, f"{path}:{open_index}"):
             prompt_sent = 1
         if _TUI_JOB_ACTIVE.is_set():
+            # The phone-started job owns the running turn and its card.
+            _ambient_card_close("handover")
             return prompt_sent
         job = _tui_inflight_load()
         if job and job.get("text"):
@@ -3787,11 +3860,14 @@ def mirror_local_tui_turns():
         if tail_is_busy(rows):
             if _HANDOFF_CARD and _HANDOFF_CARD.active:
                 _HANDOFF_CARD.update(last_tool_flow_line(rows))
+            else:
+                _ambient_card_progress(path, rows, open_q, open_index)
             _TUI_TURN_BUSY.set()
             return prompt_sent
         if not progress_ready:
             return prompt_sent
         _TUI_TURN_BUSY.clear()
+        _ambient_card_settle(rows)
         pairs = assistant_final_pairs(rows)
         rec = load_cursor_state()
         runtime_new = _transcript_is_runtime_new_session(path, rec)

@@ -39,7 +39,7 @@ Expected result: no matches.
 4. Compile and run the exported suite:
 
 ```bash
-python3 -m py_compile dist/cursor-telegram-bridge/cursor_telegram_bridge.py
+python3 -m py_compile dist/cursor-telegram-bridge/cursor_telegram_bridge.py dist/cursor-telegram-bridge/bridge_setup.py
 ( cd dist/cursor-telegram-bridge && python3 -m unittest discover -s tests -p 'test_*.py' )
 ```
 

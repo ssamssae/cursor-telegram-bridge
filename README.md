@@ -11,6 +11,17 @@ Bridge](https://github.com/ssamssae/codex-telegram-bridge), and the [Grok
 Telegram Bridge](https://github.com/ssamssae/grok-telegram-bridge), but it does
 not share sessions or credentials with any of them.
 
+## New in 0.4.9
+
+One command now sets the bridge up the way its author runs it:
+`python3 bridge_setup.py setup --like-author`. It saves your bot token and chat
+id, starts Cursor inside the `cursor` tmux session, registers a background
+service, adds the `cursor-tg` command, and checks both directions once at the
+end. With that setup, a turn you type in the Cursor window gets the same
+progress card and Stop button on your phone as a turn sent from the phone. See
+[Like the author, in one command](#like-the-author-in-one-command) and the
+[release notes](RELEASE_NOTES-0.4.9.md).
+
 ## Read This First
 
 **This bridge gives a chat app the ability to run commands on your computer.**
@@ -107,6 +118,44 @@ this repo's. The bridge only needs the binary on your `PATH`.
 ## Quick Start
 
 Five steps. Nothing here assumes you have made a bot before.
+
+### Like the author, in one command
+
+Create your bot first ([Step 1](#step-1--create-your-own-bot) below). Then run:
+
+```bash
+git clone https://github.com/ssamssae/cursor-telegram-bridge.git && cd cursor-telegram-bridge && python3 bridge_setup.py setup --like-author
+```
+
+Only two things still need you: paste the token at the hidden prompt, and send
+`/start` to your bot so setup can learn your chat id. Everything else is done
+for you: the private settings file `~/.config/cursor-telegram-bridge/bridge.env`
+(an existing one is kept as a backup), Cursor started inside the tmux session
+`cursor`, a background service (launchd on macOS, `systemd --user` on Linux),
+the `cursor-tg` command, one test message, and a short self-check that sends
+one message from your phone to the terminal and back, then mirrors one terminal
+prompt to your phone. The self-check never types into Cursor while Cursor is
+asking a question, such as whether to trust a folder.
+
+Without `--like-author`, setup asks `Use the author's setup (recommended)? [Y/n]`
+first, and the default is yes. Answer `n` to keep the public defaults. The
+author's setup changes three settings:
+
+| Setting | Author | Default | What it does |
+| --- | --- | --- | --- |
+| `CUB_TUI_MIRROR_LOCAL` | `1` | `0` | Turns typed in the Cursor window also reach your phone. |
+| `CUB_FLOW_MIRROR` | `1` | off | Live progress card with a Stop button, for phone and terminal turns. |
+| `CUB_CONTEXT_CLEAR_PCT` | `0` | `50` | Never sends `/clear` on its own. |
+
+From then on, type `cursor-tg` in any terminal to land in the one Cursor
+session the bridge drives. Phone and terminal share that session, and a
+terminal that is already attached stays attached. A Cursor agent started
+anywhere else is not connected to your phone; setup warns when it sees one.
+Add `--dry-run` to print what setup would do without changing anything. To
+stop the service later, run `launchctl bootout gui/$(id -u)/com.user.cursor-telegram-bridge`
+on macOS or `systemctl --user disable --now cursor-telegram-bridge` on Linux.
+
+The steps below are the manual way to do the same thing.
 
 ### Step 1 — Create your own bot
 

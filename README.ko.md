@@ -5,6 +5,41 @@
 텔레그램의 본인 전용 봇으로 컴퓨터의 Cursor에 메시지를 보내고 답변을 받습니다.
 브릿지 언어는 한국어·영어 중 고를 수 있습니다. AI 답변의 언어와 모델 설정은 별개입니다.
 
+## 0.4.9 새 기능
+
+명령 하나로 제작자와 같은 설정을 합니다: `python3 bridge_setup.py setup --like-author`.
+봇 토큰과 본인 채팅 ID를 저장하고, tmux 세션 `cursor` 안에서 Cursor를 띄우고, 상시 서비스를 등록하고,
+`cursor-tg` 명령을 만들고, 끝에 두 방향을 한 번씩 확인합니다.
+이 설정에서는 Cursor 창에서 직접 친 요청도 폰에서 보낸 요청과 같은 진행 카드와 중지 버튼을 받습니다.
+자세한 내용은 아래 절과 [릴리스 노트](RELEASE_NOTES-0.4.9.md)에 있습니다.
+
+## 제작자와 똑같이 쓰기 (한 줄 설치)
+
+BotFather에서 본인 전용 봇을 먼저 만드세요. 그다음 이 한 줄을 실행합니다.
+
+```bash
+git clone https://github.com/ssamssae/cursor-telegram-bridge.git && cd cursor-telegram-bridge && python3 bridge_setup.py setup --like-author --language ko
+```
+
+사람 손이 필요한 일은 둘뿐입니다. 숨김 입력칸에 토큰을 붙여 넣는 것과, 봇에 `/start`를 보내는 것.
+나머지는 자동입니다. 설정 파일 `~/.config/cursor-telegram-bridge/bridge.env`(기존 파일은 백업),
+tmux 세션 `cursor`와 그 안의 Cursor 실행, 상시 서비스(macOS launchd, Linux `systemd --user`),
+`cursor-tg` 명령, 시험 메시지 1통, 그리고 폰→터미널→폰·터미널→폰 두 방향을 한 번씩 돌려 보는 자가 점검까지 합니다.
+Cursor가 폴더 신뢰 같은 질문을 띄우고 있으면 자가 점검은 키를 입력하지 않습니다.
+`--like-author` 없이 실행하면 첫 질문으로 `Use the author's setup (recommended)? [Y/n]`을 묻고 기본값은 예입니다.
+`n`으로 답하면 공개 기본값을 유지합니다. 제작자 설정이 바꾸는 값은 셋입니다.
+
+| 설정 | 제작자 | 기본값 | 켜지는 것 |
+| --- | --- | --- | --- |
+| `CUB_TUI_MIRROR_LOCAL` | `1` | `0` | Cursor 창에서 직접 친 요청도 폰으로 옴 |
+| `CUB_FLOW_MIRROR` | `1` | 꺼짐 | 진행 카드와 중지 버튼(폰 요청·터미널 요청 모두) |
+| `CUB_CONTEXT_CLEAR_PCT` | `0` | `50` | `/clear`를 저절로 보내지 않음 |
+
+그다음부터는 어느 터미널에서든 `cursor-tg`를 치면 브릿지가 쓰는 바로 그 Cursor 세션에 붙습니다. 폰과 터미널이 같은 세션을 씁니다.
+이미 붙어 있는 다른 터미널은 떨어지지 않습니다. 따로 연 Cursor는 폰과 연결되지 않으며, 설정 도구가 그런 창을 보면 경고합니다.
+`--dry-run`을 붙이면 아무것도 바꾸지 않고 할 일만 보여 줍니다.
+아래 「시작하기」는 같은 일을 손으로 하는 방법입니다.
+
 ## 시작하기
 
 ```bash
