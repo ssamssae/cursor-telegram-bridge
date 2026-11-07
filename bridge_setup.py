@@ -6,11 +6,13 @@
     python3 bridge_setup.py setup --like-author --dry-run  show what would happen, change nothing
     python3 bridge_setup.py attach                         same as the cursor-tg command
     python3 bridge_setup.py run                            what the background service runs
+    python3 bridge_setup.py doctor                         check the install any time (--offline: no Telegram)
 
 Setup saves the bot token and your chat id, writes bridge.env (the previous one is
 kept as a backup), starts Cursor inside the tmux session the bridge drives,
 registers a background service (launchd on macOS, systemd --user on Linux),
-links the cursor-tg command and sends one test message to your phone.
+links the cursor-tg command and sends one test message to your phone. `doctor`
+checks an install at any time and changes nothing.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -39,12 +42,18 @@ SETUP_SCRIPT = APP_DIR / "bridge_setup.py"
 BRIDGE_SCRIPT = APP_DIR / "cursor_telegram_bridge.py"
 ATTACH_COMMAND = "cursor-tg"
 ATTACH_SCRIPT = APP_DIR / ATTACH_COMMAND
+DOCTOR_COMMAND = "python3 bridge_setup.py doctor"
 SERVICE_NAME = f"{APP_NAME}.service"
 LAUNCHD_LABEL = f"com.user.{APP_NAME}"
+# The line every service file setup writes carries. A file without it was not
+# written by this setup, so setup keeps a copy before it writes over that file.
+SERVICE_FILE_MARKER = f"Written by bridge_setup.py for {APP_NAME}"
 DEFAULT_SOCKET = "default"
 DEFAULT_SESSION = "cursor"
 SESSION_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 CHAT_ID_RE = re.compile(r"-?[0-9]+")
+EXAMPLE_CHAT_ID = "123456789"  # the placeholder in config.example.env
+TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on"})  # the bridge's own reading of a boolean setting
 AUTHOR_PRESET_QUESTION = "Use the author's setup (recommended)? [Y/n] "
 # "Like the author": the switches where the author's own bridge differs from the
 # public defaults in config.example.env. Every other setting already matches.
@@ -231,6 +240,12 @@ def telegram_call(token: str, method: str, timeout: int = 60, **params: Any) -> 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
+    except urllib.error.HTTPError as exc:  # a refused token still comes back as Telegram's JSON answer
+        try:
+            with exc:
+                payload = json.load(exc)
+        except Exception:  # noqa: BLE001 - no JSON body becomes "no answer"
+            return None
     except Exception:  # noqa: BLE001 - network errors become "no answer"
         return None
     return payload if isinstance(payload, dict) else None
@@ -430,7 +445,7 @@ def service_command(config_file: Path) -> list[str]:
 
 
 def launchd_plist_bytes(command: list[str], log_file: Path) -> bytes:
-    return plistlib.dumps({
+    body = plistlib.dumps({
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": command,
         "RunAtLoad": True,
@@ -438,6 +453,8 @@ def launchd_plist_bytes(command: list[str], log_file: Path) -> bytes:
         "StandardOutPath": str(log_file),
         "StandardErrorPath": str(log_file),
     })
+    marker = f"<!-- {SERVICE_FILE_MARKER}; setup replaces this file. -->\n".encode()
+    return body.replace(b"<plist ", marker + b"<plist ", 1)
 
 
 def systemd_quote(value: str) -> str:
@@ -450,6 +467,7 @@ def systemd_quote(value: str) -> str:
 
 def systemd_unit_text(command: list[str]) -> str:
     return "\n".join([
+        f"# {SERVICE_FILE_MARKER}; setup replaces this file.",
         "[Unit]",
         "Description=Cursor Telegram Bridge",
         "After=network-online.target",
@@ -467,6 +485,34 @@ def systemd_unit_text(command: list[str]) -> str:
     ])
 
 
+def service_file_is_ours(path: Path) -> bool:
+    """True when setup wrote this service file: it carries SERVICE_FILE_MARKER."""
+    try:
+        return SERVICE_FILE_MARKER.encode() in path.read_bytes()
+    except OSError:
+        return False
+
+
+def back_up_foreign_service_file(path: Path, *, ask: Callable[[str], str] | None, backup_dir: Path | None) -> bool:
+    """Before setup writes `path`: copy a file that setup did not write, and say so.
+
+    Interactive setup asks first. Returns False when you answer n; setup then leaves
+    the file and the service alone. The copy goes next to bridge.env, not beside the
+    service file, so launchd or systemd never loads it again.
+    """
+    if not path.exists() or service_file_is_ours(path):
+        return True
+    question = f"{path} exists and was not written by bridge_setup.py. Back it up and replace it? [Y/n] "
+    if ask is not None and ask(question).strip().lower() in {"n", "no"}:
+        warn(f"kept {path}; the background service was not installed or restarted")
+        return False
+    backup = backup_path((backup_dir or default_config_dir()) / path.name)
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup)
+    warn(f"{path} was not written by bridge_setup.py; saved a copy as {backup} before replacing it")
+    return True
+
+
 def install_service(
     *,
     config_file: Path,
@@ -475,11 +521,15 @@ def install_service(
     os_name: str,
     run: RunCommand,
     sleep: Callable[[float], None],
+    ask: Callable[[str], str] | None = None,
+    backup_dir: Path | None = None,
 ) -> tuple[str, bool]:
     """Register and (re)start the background service. Returns (kind, started)."""
     command = service_command(config_file)
     service_file = service_file or default_service_file(os_name)
     if os_name == "Darwin" and service_file is not None:
+        if not back_up_foreign_service_file(service_file, ask=ask, backup_dir=backup_dir):
+            return "launchd", False
         service_file.parent.mkdir(parents=True, exist_ok=True)
         service_file.write_bytes(launchd_plist_bytes(command, state_dir / "bridge.log"))
         domain = f"gui/{getattr(os, 'getuid', lambda: 0)()}"
@@ -494,6 +544,8 @@ def install_service(
         warn(f"launchd did not start {LAUNCHD_LABEL}: {(loaded.stderr or loaded.stdout or '').strip()}")
         return "launchd", False
     if os_name == "Linux" and service_file is not None:
+        if not back_up_foreign_service_file(service_file, ask=ask, backup_dir=backup_dir):
+            return "systemd", False
         service_file.parent.mkdir(parents=True, exist_ok=True)
         service_file.write_text(systemd_unit_text(command), encoding="utf-8")
         run(["systemctl", "--user", "daemon-reload"])
@@ -687,7 +739,22 @@ def cursor_processes_outside(session_ttys: set[str] | list[str], ps_text: str) -
     return found
 
 
-def warn_cursor_outside_session(*, tmux_bin: str, socket: str, session: str, run: RunCommand) -> int:
+def cursor_processes_inside(session_ttys: set[str] | list[str], ps_text: str) -> list[tuple[str, str]]:
+    """(pid, tty) of Cursor agents on a terminal of the bridge session; ps_text as above."""
+    inside = {tty_name(tty) for tty in session_ttys if tty and tty.strip()}
+    found: list[tuple[str, str]] = []
+    for raw in ps_text.splitlines():
+        parts = raw.split(None, 2)
+        if len(parts) < 3 or parts[1] in NO_TTY or tty_name(parts[1]) not in inside:
+            continue
+        if CURSOR_PROCESS_RE.search(parts[2]):
+            found.append((parts[0], parts[1]))
+    return found
+
+
+def warn_cursor_outside_session(*, tmux_bin: str, socket: str, session: str, run: RunCommand,
+                                report: Callable[[str], None] = warn) -> int:
+    """Warn (setup's last step, and doctor) about Cursor running on a terminal the phone cannot see."""
     panes = run([tmux_bin, "-L", socket, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_tty}"])
     ttys = set((panes.stdout or "").split()) if panes.returncode == 0 else set()
     processes = run(["ps", "-A", "-ww", "-o", "pid=,tty=,args="])
@@ -695,7 +762,7 @@ def warn_cursor_outside_session(*, tmux_bin: str, socket: str, session: str, run
     if not outside:
         return 0
     listed = ", ".join(f"pid {pid} on {tty}" for pid, tty in outside)
-    warn(
+    report(
         f"Cursor is also running outside the bridge tmux session ({listed}). Your phone cannot see that "
         f"window; use {ATTACH_COMMAND} so the phone and the terminal share one Cursor session."
     )
@@ -735,7 +802,32 @@ def setup_plan_lines(options: SetupOptions, *, os_name: str, tmux_bin: str | Non
             f"self-check after install: bot -> phone, phone -> terminal -> phone ({int(SELF_CHECK_PHONE_TIMEOUT)} s), "
             f"terminal -> phone ({int(SELF_CHECK_TERMINAL_TIMEOUT)} s)"
         )
+    replaced = files_setup_writes_over(options, os_name=os_name)
+    if replaced:
+        lines.append("files already there that setup writes over:")
+        lines.extend(f"  {item}" for item in replaced)
+    else:
+        lines.append("files already there that setup writes over: none")
     return lines
+
+
+def files_setup_writes_over(options: SetupOptions, *, os_name: str) -> list[str]:
+    """Files already on disk that setup would write over, each with what happens to it. Reads only.
+
+    A saved token file is not one of them: setup reuses it unless you paste a new token.
+    """
+    found: list[str] = []
+    if options.config_file.exists():
+        found.append(f"{options.config_file} (a copy is kept first)")
+    service_file = options.service_file or default_service_file(os_name)
+    if service_file is not None and service_file.exists():
+        if service_file_is_ours(service_file):
+            found.append(str(service_file))
+        else:
+            found.append(
+                f"{service_file} (not written by bridge_setup.py: a copy goes to {options.config_file.parent} first)"
+            )
+    return found
 
 
 def obtain_token(options: SetupOptions, *, ask: Callable[[str], str], read_secret: Callable[[str], str]) -> tuple[str, bool]:
@@ -864,7 +956,9 @@ def _setup(options: SetupOptions, *, existing: dict[str, str], tmux_bin: str | N
 
     step(5, "Background service")
     kind, started = install_service(config_file=options.config_file, state_dir=options.state_dir,
-                                    service_file=options.service_file, os_name=os_name, run=run, sleep=sleep)
+                                    service_file=options.service_file, os_name=os_name, run=run, sleep=sleep,
+                                    ask=None if options.non_interactive else ask,
+                                    backup_dir=options.config_file.parent)
 
     sent = send_text(token, chat_id, phone_text("test", options.language), api_call)
     if sent:
@@ -886,6 +980,7 @@ def _setup(options: SetupOptions, *, existing: dict[str, str], tmux_bin: str | N
             note(f"Self-check skipped: the {kind} service is not running.")
     if tmux_bin:
         warn_cursor_outside_session(tmux_bin=tmux_bin, socket=DEFAULT_SOCKET, session=DEFAULT_SESSION, run=run)
+    out(f"Check the bridge again any time: {DOCTOR_COMMAND}")
     return 0
 
 
@@ -958,6 +1053,219 @@ def run_bridge(config_file: Path, *, exec_fn: Callable[[str, list[str], dict[str
     return 0
 
 
+class DoctorReport:
+    """One [ok], [warn] or [fail] line per check. Any failure makes doctor exit with 1."""
+
+    def __init__(self) -> None:
+        self.failures = 0
+        self.warnings = 0
+
+    def ok(self, message: str) -> None:
+        out(f"[ok] {message}")
+
+    def warn(self, message: str) -> None:
+        self.warnings += 1
+        out(f"[warn] {message}")
+
+    def fail(self, message: str) -> None:
+        self.failures += 1
+        out(f"[fail] {message}")
+
+
+def current_user() -> str:
+    try:
+        return os.environ.get("USER") or getpass.getuser()
+    except (OSError, KeyError):  # no USER and no password entry
+        return ""
+
+
+def doctor_private_file(report: DoctorReport, label: str, path: Path) -> None:
+    """[ok] when only your user can read the file; [warn] with the chmod that fixes it otherwise."""
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError as exc:
+        report.warn(f"{label}: could not read the permissions of {path} ({exc.strerror or exc})")
+        return
+    if mode & 0o077:
+        report.warn(f"{label} is open to other users (mode {mode:o}); fix it with: chmod 600 {shlex.quote(str(path))}")
+    else:
+        report.ok(f"{label}: {path} (only you can read it)")
+
+
+def doctor_telegram(report: DoctorReport, token: str, *, offline: bool, api_call: ApiCall) -> None:
+    """One getMe call. A refused token fails; no answer at all (offline, DNS, timeout) only warns."""
+    if offline:
+        note("Telegram not contacted (--offline).")
+        return
+    payload = api_call(token, "getMe", timeout=15)
+    if not payload:
+        report.warn("Telegram did not answer; check the network, or skip this check with --offline")
+        return
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    if payload.get("ok"):
+        report.ok(f"Telegram accepts the token: @{result.get('username') or '?'}")
+        return
+    reason = str(payload.get("description") or "refused").replace(token, "<token>")[:80]
+    report.fail(f"Telegram refused the token ({reason}); copy it again from @BotFather and run setup")
+
+
+def doctor_tmux(report: DoctorReport, config: dict[str, str], *, run: RunCommand, which: Which) -> None:
+    """tmux, the bridge session, Cursor inside it, and Cursor on any other terminal."""
+    socket = config.get("CUB_TMUX_SOCKET") or DEFAULT_SOCKET
+    session = config.get("CUB_TMUX_SESSION") or DEFAULT_SESSION
+    headless = (config.get("CUB_TUI_FALLBACK_HEADLESS") or "1").strip().lower() in TRUE_WORDS
+    tmux_bin = which("tmux")
+    if not tmux_bin:
+        message = "tmux not found (macOS: brew install tmux, Debian or Ubuntu: sudo apt install tmux)"
+        if headless:
+            report.warn(f"{message}; each message runs one headless cursor-agent, with no Cursor window to share")
+        else:
+            report.fail(f"{message}; with CUB_TUI_FALLBACK_HEADLESS=0 messages from your phone get an error")
+        return
+    report.ok(f"tmux: {tmux_bin}")
+    if run([tmux_bin, "-L", socket, "has-session", "-t", f"={session}"]).returncode != 0:
+        message = f"tmux session {socket}/{session} is not running; start it with {ATTACH_COMMAND}"
+        if headless:
+            report.warn(f"{message}. Until then each message runs one headless cursor-agent")
+        else:
+            report.fail(f"{message}. Until then messages from your phone get an error")
+        return
+    report.ok(f"tmux session {socket}/{session} is running")
+    panes = run([tmux_bin, "-L", socket, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_tty}"])
+    ttys = set((panes.stdout or "").split()) if panes.returncode == 0 else set()
+    if not ttys:
+        report.warn(f"could not read the panes of {socket}/{session}; look at it with {ATTACH_COMMAND}")
+        return
+    inside = cursor_processes_inside(ttys, run(["ps", "-A", "-ww", "-o", "pid=,tty=,args="]).stdout or "")
+    if inside:
+        report.ok(f"Cursor is running in the bridge session {socket}/{session} (pid {inside[0][0]})")
+    else:
+        report.warn(f"no Cursor agent in the bridge session {socket}/{session}; look at it with {ATTACH_COMMAND}")
+    outside = warn_cursor_outside_session(tmux_bin=tmux_bin, socket=socket, session=session, run=run,
+                                          report=report.warn)
+    if not outside:
+        report.ok("no Cursor agent runs on another terminal")
+
+
+def doctor_linger(report: DoctorReport, *, run: RunCommand, user: str) -> None:
+    """Linux: without linger, systemd stops your user services when you log out. Doctor never turns it on."""
+    shown = run(["loginctl", "show-user", user, "-p", "Linger"])
+    linger = ""
+    for line in (shown.stdout or "").splitlines():
+        if line.strip().startswith("Linger="):
+            linger = line.strip()[len("Linger="):].strip().lower()
+    if linger == "yes":
+        report.ok("linger: on, so the service keeps running after you log out")
+    elif linger == "no":
+        report.warn(
+            "linger: off, so the service stops when you log out. "
+            f"To keep it running, run: sudo loginctl enable-linger {shlex.quote(user)}"
+        )
+    else:
+        detail = (shown.stderr or shown.stdout or f"exit {shown.returncode}").strip().splitlines()
+        report.warn(
+            f"linger: unknown ({detail[-1] if detail else 'no answer'}); "
+            "without linger the service stops when you log out"
+        )
+
+
+def doctor_service(report: DoctorReport, *, os_name: str, service_file: Path | None, config_file: Path,
+                   run: RunCommand, user: str) -> None:
+    """The background service: launchd on macOS; systemd --user and linger on Linux."""
+    manual = shlex.join(service_command(config_file))
+    service_file = service_file or default_service_file(os_name)
+    if os_name == "Darwin":
+        domain = f"gui/{getattr(os, 'getuid', lambda: 0)()}"
+        if run(["launchctl", "print", f"{domain}/{LAUNCHD_LABEL}"]).returncode == 0:
+            report.ok(f"service: launchd {LAUNCHD_LABEL} is loaded")
+        elif service_file is not None and service_file.is_file():
+            report.warn(f"service: launchd {LAUNCHD_LABEL} is not loaded; start it with: "
+                        f"launchctl bootstrap {domain} {shlex.quote(str(service_file))}")
+        else:
+            report.warn(f"service: not installed ({service_file} is missing); run setup, or start the bridge with: {manual}")
+        return
+    if os_name != "Linux":
+        report.warn(f"service: not automated on {os_name}; start the bridge with: {manual}")
+        return
+    state = (run(["systemctl", "--user", "is-active", SERVICE_NAME]).stdout or "").strip()
+    if not state:
+        report.warn(f"service: systemd --user is not available here; start the bridge with: {manual}")
+        return
+    if state == "active":
+        report.ok(f"service: systemd --user {SERVICE_NAME} is active")
+    elif service_file is not None and service_file.is_file():
+        report.warn(
+            f"service: {SERVICE_NAME} is {state}; start it with: systemctl --user restart {SERVICE_NAME} "
+            f"(log: journalctl --user -u {SERVICE_NAME})"
+        )
+    else:
+        report.warn(f"service: not installed ({service_file} is missing); run setup, or start the bridge with: {manual}")
+    doctor_linger(report, run=run, user=user)
+
+
+def doctor_summary(report: DoctorReport) -> int:
+    out(f"doctor complete: {report.failures} failure(s), {report.warnings} warning(s)")
+    return 1 if report.failures else 0
+
+
+def doctor(
+    config_file: Path,
+    *,
+    offline: bool = False,
+    service_file: Path | None = None,
+    api_call: ApiCall = telegram_call,
+    run: RunCommand = run_command,
+    which: Which = shutil.which,
+    os_name: str | None = None,
+    user: str | None = None,
+) -> int:
+    """Check an install and change nothing. Exit code 1 when any check fails. Never prints the token."""
+    os_name = os_name or platform.system()
+    report = DoctorReport()
+    out("Cursor Telegram Bridge doctor")
+    if not config_file.is_file():
+        report.fail(f"bridge.env missing: {config_file}; run `python3 bridge_setup.py setup` first")
+        return doctor_summary(report)
+    doctor_private_file(report, "bridge.env", config_file)
+    config = load_env_file(config_file)
+
+    chat_id = (config.get("CUB_CHAT_ID") or "").strip()
+    if not chat_id:
+        report.fail("bridge.env has no CUB_CHAT_ID; run setup again")
+    elif chat_id == EXAMPLE_CHAT_ID or not CHAT_ID_RE.fullmatch(chat_id):
+        report.fail(f"CUB_CHAT_ID={chat_id} is not your chat id; run setup again to detect it")
+    else:
+        report.ok(f"chat id: {chat_id}")
+
+    token = ""
+    token_setting = (config.get("CUB_TOKEN_FILE") or "").strip()
+    if not token_setting:
+        report.fail("bridge.env has no CUB_TOKEN_FILE; run setup again")
+    else:
+        token_file = expand_path(token_setting)
+        if not token_file.is_file():
+            report.fail(f"token file missing: {token_file}; run setup again")
+        else:
+            token = read_token_file(token_file)
+            if token:
+                doctor_private_file(report, "token file", token_file)
+            else:
+                report.fail(f"token file has no api_key: {token_file}; run setup again")
+    if token:
+        doctor_telegram(report, token, offline=offline, api_call=api_call)
+
+    cursor_bin = resolve_cursor_bin(config, which)
+    if cursor_bin:
+        report.ok(f"cursor-agent: {cursor_bin}")
+    else:
+        report.fail(f"cursor-agent not found ({config.get('CUB_CURSOR_BIN') or 'cursor-agent'}); install Cursor's "
+                    "CLI, or set CUB_CURSOR_BIN to its full path")
+    doctor_tmux(report, config, run=run, which=which)
+    doctor_service(report, os_name=os_name, service_file=service_file, config_file=config_file, run=run,
+                   user=current_user() if user is None else user)
+    return doctor_summary(report)
+
+
 def build_parser(prog: str = "bridge_setup.py") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog, description="Set up and run the Cursor Telegram Bridge")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -978,6 +1286,11 @@ def build_parser(prog: str = "bridge_setup.py") -> argparse.ArgumentParser:
     attach_parser.add_argument("--no-create", action="store_true", help="fail instead of starting a missing session")
     run_parser = commands.add_parser("run", help="start the bridge with bridge.env (used by the service)")
     run_parser.add_argument("--config", type=expand_path, default=default_config_file())
+    doctor_parser = commands.add_parser(
+        "doctor", help="check bridge.env, the token, tmux, the service and linger, and Cursor on other terminals"
+    )
+    doctor_parser.add_argument("--config", type=expand_path, default=default_config_file())
+    doctor_parser.add_argument("--offline", action="store_true", help="do not contact Telegram")
     return parser
 
 
@@ -997,6 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
         return attach_command(args.config, create_missing=not args.no_create)
     if args.command == "run":
         return run_bridge(args.config)
+    if args.command == "doctor":
+        return doctor(args.config, offline=args.offline)
     return setup_bridge(SetupOptions(
         config_file=args.config,
         token_file=args.token_file,

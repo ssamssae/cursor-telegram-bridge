@@ -6,6 +6,14 @@
 # @mutate packaging/cursor-telegram-bridge/bridge_setup.py | if name in inside or name in seen: | if name in seen:
 # @mutate-why Typing the probe while Cursor shows a question would press Enter on it (workspace trust defaults to Trust).
 # @mutate packaging/cursor-telegram-bridge/bridge_setup.py | waiting_before_probe = cursor_is_waiting() | waiting_before_probe = False
+# @mutate-why doctor reads Linger=no as on, so a Linux service that stops at logout gets no warning
+# @mutate packaging/cursor-telegram-bridge/bridge_setup.py | if linger == "yes": | if linger == "no":
+# @mutate-why doctor stops warning about a Cursor agent on another terminal, which the phone cannot see
+# @mutate packaging/cursor-telegram-bridge/bridge_setup.py | outside = warn_cursor_outside_session( | outside = 0 and warn_cursor_outside_session(
+# @mutate-why doctor exits 0 after a failed check, so a script cannot tell a broken install
+# @mutate packaging/cursor-telegram-bridge/bridge_setup.py | return 1 if report.failures else 0 | return 0
+# @mutate-why setup writes over a service file it did not write, with no copy and no warning
+# @mutate packaging/cursor-telegram-bridge/bridge_setup.py | if not path.exists() or service_file_is_ours(path): | if True:
 """One-command setup for the Cursor Telegram Bridge (T-261107-014).
 
 Covers `bridge_setup.py`: the "like the author" preset and its first wizard
@@ -24,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -54,7 +63,8 @@ class FakeRun:
     """Records commands; answers tmux, ps, launchctl and systemctl like a quiet machine."""
 
     def __init__(self, *, session_exists=False, first_window="0", clients="", pane_ttys="/dev/ttys008\n",
-                 ps_text="", socket_path="", fail_new_session=False, screen=""):
+                 ps_text="", socket_path="", fail_new_session=False, screen="", service_state="active",
+                 linger="yes", launchctl_rc=0):
         self.calls = []
         self.session_exists = session_exists
         self.first_window = first_window
@@ -64,6 +74,9 @@ class FakeRun:
         self.socket_path = socket_path
         self.fail_new_session = fail_new_session
         self.screen = screen
+        self.service_state = service_state  # "" = systemd --user is not available
+        self.linger = linger
+        self.launchctl_rc = launchctl_rc
 
     def __call__(self, cmd):
         cmd = list(cmd)
@@ -89,6 +102,14 @@ class FakeRun:
             return completed(cmd)
         if cmd[0] == "ps":
             return completed(cmd, stdout=self.ps_text)
+        if cmd[0] == "systemctl" and "is-active" in cmd:
+            if not self.service_state:
+                return completed(cmd, 1, stderr="Failed to connect to bus: No medium found")
+            return completed(cmd, 0 if self.service_state == "active" else 3, stdout=self.service_state + "\n")
+        if cmd[0] == "loginctl":
+            return completed(cmd, stdout=f"Linger={self.linger}\n")
+        if cmd[:2] == ["launchctl", "print"]:
+            return completed(cmd, self.launchctl_rc, stderr="" if self.launchctl_rc == 0 else "Could not find service")
         return completed(cmd)
 
     def commands(self, word):
@@ -673,6 +694,316 @@ class RunAndParserTests(SetupTestCase):
         self.assertEqual(args.language, "ko")
         self.assertEqual(parser.parse_args(["attach", "--no-create"]).command, "attach")
         self.assertEqual(parser.parse_args(["run"]).command, "run")
+
+
+class DoctorTests(SetupTestCase):
+    PS = (
+        " 2198 ttys008  /home/dev/.local/bin/cursor-agent --use-system-ca /home/dev/.local/share/cursor-agent/versions/1/index.js\n"
+        "28961 ??       /home/dev/.local/bin/agent --use-system-ca /home/dev/.local/share/cursor-agent/versions/1/index.js acp\n"
+    )
+
+    def install(self, *, chat_id=CHAT, token=TOKEN, env_mode=0o600, token_mode=0o600, extra=()):
+        """A finished install: bridge.env, the token file and the service file, as setup writes them."""
+        options = self.options()
+        options.config_file.parent.mkdir(parents=True, exist_ok=True)
+        options.token_file.write_text(json.dumps({"api_key": token}), encoding="utf-8")
+        os.chmod(options.token_file, token_mode)
+        lines = [f"CUB_TOKEN_FILE={options.token_file}", f"CUB_STATE_DIR={options.state_dir}",
+                 f"CUB_CURSOR_BIN={CURSOR}", "CUB_TMUX_SOCKET=default", "CUB_TMUX_SESSION=cursor", *extra]
+        if chat_id is not None:
+            lines.append(f"CUB_CHAT_ID={chat_id}")
+        options.config_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(options.config_file, env_mode)
+        options.service_file.parent.mkdir(parents=True, exist_ok=True)
+        options.service_file.write_text("unit\n", encoding="utf-8")
+        return options
+
+    def doctor(self, options, *, run=None, api=None, which=None, os_name="Linux", offline=False):
+        run = run if run is not None else FakeRun(session_exists=True, ps_text=self.PS)
+        api = api if api is not None else FakeTelegram()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rc = setup.doctor(options.config_file, offline=offline, service_file=options.service_file, api_call=api,
+                              run=run, which=which or fake_which(), os_name=os_name, user="tester")
+        return rc, output.getvalue(), run, api
+
+    def lines(self, text, word):
+        """The [ok]/[warn]/[fail] lines that mention `word`, in order."""
+        return [line for line in text.splitlines() if line.startswith("[") and word in line.lower()]
+
+    def test_healthy_install_prints_only_ok_lines_and_exits_zero(self):
+        rc, text, run, api = self.doctor(self.install())
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn("[warn]", text)
+        self.assertNotIn("[fail]", text)
+        for needle in ("bridge.env", "token file", "@cursorbot", CURSOR, "default/cursor", "pid 2198",
+                       setup.SERVICE_NAME, "linger"):
+            self.assertIn(needle, text)
+        self.assertIn("doctor complete: 0 failure(s), 0 warning(s)", text)
+        self.assertEqual([method for method, _params in api.calls], ["getMe"], "doctor contacts Telegram once at most")
+        self.assertIn(["systemctl", "--user", "is-active", setup.SERVICE_NAME], run.calls)
+        self.assertIn(["loginctl", "show-user", "tester", "-p", "Linger"], run.calls)
+        self.assertNotIn(TOKEN, text)
+
+    def test_missing_bridge_env_fails_with_exit_code_one_and_checks_nothing_else(self):
+        rc, text, run, api = self.doctor(self.options())
+        self.assertEqual(rc, 1, text)
+        self.assertTrue(text.splitlines()[1].startswith("[fail]"), text)
+        self.assertIn("bridge_setup.py setup", text)
+        self.assertEqual(run.calls, [])
+        self.assertEqual(api.calls, [])
+
+    def test_files_others_can_read_warn_with_chmod_and_the_token_is_never_printed(self):
+        rc, text, _run, _api = self.doctor(self.install(env_mode=0o644, token_mode=0o644))
+        self.assertEqual(rc, 0, text)
+        warnings = [line for line in text.splitlines() if line.startswith("[warn]")]
+        self.assertEqual(len(warnings), 2, text)
+        for line in warnings:
+            self.assertIn("chmod 600", line)
+        self.assertNotIn(TOKEN, text)
+
+    def test_refused_token_fails_and_no_answer_from_telegram_only_warns(self):
+        rc, text, _run, _api = self.doctor(self.install(token="revoked-token-value"))
+        self.assertEqual(rc, 1, text)
+        self.assertTrue(self.lines(text, "telegram")[0].startswith("[fail]"), text)
+        self.assertNotIn("revoked-token-value", text)
+
+        rc, text, _run, _api = self.doctor(self.install(), api=lambda *args, **kwargs: None)
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(self.lines(text, "telegram")[0].startswith("[warn]"), text)
+
+    def test_offline_never_contacts_telegram(self):
+        def no_network(*args, **kwargs):
+            raise AssertionError("doctor --offline contacted Telegram")
+
+        rc, text, _run, _api = self.doctor(self.install(), api=no_network, offline=True)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("--offline", text)
+
+    def test_missing_or_placeholder_chat_id_and_a_missing_token_file_fail(self):
+        for chat_id in (None, setup.EXAMPLE_CHAT_ID, "my-chat"):
+            rc, text, _run, _api = self.doctor(self.install(chat_id=chat_id))
+            self.assertEqual(rc, 1, (chat_id, text))
+            self.assertTrue(self.lines(text, "cub_chat_id")[0].startswith("[fail]"), text)
+
+        options = self.install()
+        options.token_file.write_text(json.dumps({"api_key": ""}), encoding="utf-8")
+        rc, text, _run, _api = self.doctor(options)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("api_key", text)
+        options.token_file.unlink()
+        rc, text, _run, api = self.doctor(options)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("token file missing", text)
+        self.assertEqual(api.calls, [], "doctor asked Telegram without a token")
+
+    def test_linger_off_warns_with_the_command_that_turns_it_on_and_never_runs_it(self):
+        options = self.install()
+        rc, text, run, _api = self.doctor(options, run=FakeRun(session_exists=True, ps_text=self.PS, linger="no"))
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(self.lines(text, "linger")[0].startswith("[warn]"), text)
+        self.assertIn("log out", text)
+        self.assertIn("sudo loginctl enable-linger tester", text)
+        self.assertFalse(any("enable-linger" in cmd for cmd in run.calls), "doctor turned linger on by itself")
+
+        rc, text, _run, _api = self.doctor(options, run=FakeRun(session_exists=True, ps_text=self.PS, linger="yes"))
+        self.assertTrue(self.lines(text, "linger")[0].startswith("[ok]"), text)
+        self.assertNotIn("enable-linger", text)
+
+    def test_systemd_service_not_running_not_installed_or_unavailable_warns(self):
+        options = self.install()
+        inactive = FakeRun(session_exists=True, ps_text=self.PS, service_state="inactive")
+        rc, text, _run, _api = self.doctor(options, run=inactive)
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(self.lines(text, "service")[0].startswith("[warn]"), text)
+        self.assertIn(f"systemctl --user restart {setup.SERVICE_NAME}", text)
+
+        options.service_file.unlink()
+        rc, text, _run, _api = self.doctor(options, run=FakeRun(session_exists=True, ps_text=self.PS,
+                                                                service_state="inactive"))
+        self.assertIn("not installed", text)
+
+        rc, text, run, _api = self.doctor(options, run=FakeRun(session_exists=True, ps_text=self.PS, service_state=""))
+        self.assertIn("systemd --user is not available", text)
+        self.assertFalse(any(cmd[0] == "loginctl" for cmd in run.calls), "linger checked without systemd")
+
+    def test_launchd_service_on_macos_and_no_linger_check(self):
+        options = self.install()
+        rc, text, run, _api = self.doctor(options, os_name="Darwin")
+        self.assertEqual(rc, 0, text)
+        self.assertIn(f"[ok] service: launchd {setup.LAUNCHD_LABEL} is loaded", text)
+        self.assertFalse(any(cmd[0] in {"loginctl", "systemctl"} for cmd in run.calls))
+
+        not_loaded = FakeRun(session_exists=True, ps_text=self.PS, launchctl_rc=113)
+        rc, text, _run, _api = self.doctor(options, os_name="Darwin", run=not_loaded)
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(self.lines(text, "service")[0].startswith("[warn]"), text)
+        self.assertIn("launchctl bootstrap", text)
+
+        options.service_file.unlink()
+        rc, text, _run, _api = self.doctor(options, os_name="Darwin",
+                                           run=FakeRun(session_exists=True, ps_text=self.PS, launchctl_rc=113))
+        self.assertIn("not installed", text)
+
+    def test_tmux_and_the_session_follow_the_headless_fallback_and_cursor_agent_is_required(self):
+        rc, text, _run, _api = self.doctor(self.install(), run=FakeRun(session_exists=False))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("[warn] tmux session default/cursor is not running", text)
+        self.assertIn("cursor-tg", text)
+
+        strict = self.install(extra=("CUB_TUI_FALLBACK_HEADLESS=0",))
+        rc, text, _run, _api = self.doctor(strict, run=FakeRun(session_exists=False))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("[fail] tmux session default/cursor is not running", text)
+
+        no_tmux = fake_which({"cursor-agent": CURSOR})
+        rc, text, run, _api = self.doctor(self.install(), which=no_tmux)
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(self.lines(text, "tmux")[0].startswith("[warn]"), text)
+        self.assertEqual([cmd for cmd in run.calls if cmd[0] == TMUX], [])
+        rc, text, _run, _api = self.doctor(self.install(extra=("CUB_TUI_FALLBACK_HEADLESS=0",)), which=no_tmux)
+        self.assertEqual(rc, 1, text)
+        self.assertTrue(self.lines(text, "tmux")[0].startswith("[fail]"), text)
+
+        rc, text, _run, _api = self.doctor(self.install(), which=fake_which({"tmux": TMUX}))
+        self.assertEqual(rc, 1, text)
+        self.assertTrue(self.lines(text, "cursor-agent")[0].startswith("[fail]"), text)
+
+    def test_cursor_in_the_session_is_ok_and_cursor_on_another_terminal_warns_with_cursor_tg(self):
+        run = FakeRun(session_exists=True, pane_ttys="/dev/ttys008\n", ps_text=OutsideSessionTests.PS)
+        rc, text, _run, _api = self.doctor(self.install(), run=run)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("[ok] Cursor is running in the bridge session default/cursor (pid 2198)", text)
+        self.assertIn("[warn] Cursor is also running outside the bridge tmux session", text)
+        self.assertIn("pid 30001 on ttys011", text)
+        self.assertIn("cursor-tg", text)
+
+        lone = FakeRun(session_exists=True, ps_text=" 2201 ttys008  /bin/zsh -c ls\n")
+        rc, text, _run, _api = self.doctor(self.install(), run=lone)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("[warn] no Cursor agent in the bridge session default/cursor", text)
+        self.assertNotIn("outside the bridge tmux session", text)
+
+    def test_setup_ends_by_pointing_at_doctor(self):
+        options = self.options()
+        self.save_token(options)
+        rc, text, _run, _api = self.run_setup(options)
+        self.assertEqual(rc, 0, text)
+        last = [line for line in text.splitlines() if line.strip()][-1]
+        self.assertIn("python3 bridge_setup.py doctor", last)
+
+    def test_telegram_call_returns_the_refusal_body_of_an_http_error(self):
+        body = io.BytesIO(b'{"ok": false, "error_code": 401, "description": "Unauthorized"}')
+        refusal = urllib.error.HTTPError("https://api.telegram.org/bot-x/getMe", 401, "Unauthorized", {}, body)
+        with mock.patch.object(setup.urllib.request, "urlopen", side_effect=refusal):
+            payload = setup.telegram_call(TOKEN, "getMe", timeout=5)
+        self.assertEqual(payload, {"ok": False, "error_code": 401, "description": "Unauthorized"})
+        with mock.patch.object(setup.urllib.request, "urlopen", side_effect=OSError("no route to host")):
+            self.assertIsNone(setup.telegram_call(TOKEN, "getMe", timeout=5))
+
+    def test_parser_and_main_route_doctor_and_offline(self):
+        config = self.root / "custom.env"
+        args = setup.build_parser().parse_args(["doctor", "--offline", "--config", str(config)])
+        self.assertEqual((args.command, args.offline, args.config), ("doctor", True, config))
+        self.assertFalse(setup.build_parser().parse_args(["doctor"]).offline)
+        with mock.patch.object(setup, "doctor", return_value=1) as fake:
+            self.assertEqual(setup.main(["doctor", "--offline", "--config", str(config)]), 1)
+        fake.assert_called_once_with(config, offline=True)
+
+
+class ServiceFileSafetyTests(SetupTestCase):
+    FOREIGN_UNIT = "[Service]\nExecStart=/usr/local/bin/someone-elses-bridge\n"
+
+    def prepare(self, options, body):
+        self.save_token(options)
+        options.service_file.parent.mkdir(parents=True, exist_ok=True)
+        options.service_file.write_text(body, encoding="utf-8")
+
+    def backups(self, options):
+        return sorted(options.config_file.parent.glob(f"{options.service_file.name}.bak-*"))
+
+    def test_foreign_service_file_is_copied_beside_bridge_env_with_a_warning_then_replaced(self):
+        options = self.options()
+        self.prepare(options, self.FOREIGN_UNIT)
+        rc, text, run, _api = self.run_setup(options, os_name="Linux")
+        self.assertEqual(rc, 0, text)
+        backups = self.backups(options)
+        self.assertEqual(len(backups), 1, text)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), self.FOREIGN_UNIT)
+        self.assertEqual(list(options.service_file.parent.glob("*.bak-*")), [], "a copy beside it could load again")
+        self.assertTrue(any(line.startswith("warning:") and str(options.service_file) in line
+                            and str(backups[0]) in line for line in text.splitlines()), text)
+        self.assertIn(setup.SERVICE_FILE_MARKER, options.service_file.read_text(encoding="utf-8"))
+        self.assertIn(["systemctl", "--user", "restart", setup.SERVICE_NAME], run.calls)
+
+    def test_a_service_file_written_by_setup_is_replaced_without_a_copy_or_a_warning(self):
+        options = self.options()
+        self.save_token(options)
+        self.run_setup(options, os_name="Linux")
+        rc, text, _run, _api = self.run_setup(options, os_name="Linux")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.backups(options), [])
+        self.assertNotIn("not written by bridge_setup.py", text)
+
+    def test_foreign_launchd_plist_is_copied_and_the_new_one_carries_the_marker(self):
+        options = self.options()
+        self.prepare(options, "<plist>someone else</plist>\n")
+        rc, text, _run, _api = self.run_setup(options, os_name="Darwin")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len(self.backups(options)), 1, text)
+        self.assertIn(setup.SERVICE_FILE_MARKER.encode(), options.service_file.read_bytes())
+        self.assertEqual(plistlib.loads(options.service_file.read_bytes())["Label"], setup.LAUNCHD_LABEL)
+
+    def test_interactive_setup_asks_first_and_n_keeps_the_foreign_file_and_the_service(self):
+        options = self.options(non_interactive=False)
+        self.prepare(options, self.FOREIGN_UNIT)
+        prompts = []
+
+        def ask(prompt=""):
+            prompts.append(prompt)
+            return "n" if ("Back it up" in prompt or "author" in prompt) else ""
+
+        rc, text, run, _api = self.run_setup(options, ask=ask, os_name="Linux")
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(any(str(options.service_file) in prompt and prompt.endswith("[Y/n] ") for prompt in prompts),
+                        prompts)
+        self.assertEqual(options.service_file.read_text(encoding="utf-8"), self.FOREIGN_UNIT)
+        self.assertEqual(self.backups(options), [])
+        self.assertEqual([cmd for cmd in run.calls if cmd[0] == "systemctl"], [], "setup touched the service after n")
+        self.assertIn("kept", text)
+
+        rc, text, _run, _api = self.run_setup(options, ask=lambda prompt="": "n" if "author" in prompt else "",
+                                              os_name="Linux")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len(self.backups(options)), 1, text)
+        self.assertIn(setup.SERVICE_FILE_MARKER, options.service_file.read_text(encoding="utf-8"))
+
+    def test_dry_run_shows_the_service_file_and_the_files_setup_writes_over(self):
+        def no_network(*args, **kwargs):
+            raise AssertionError("dry run must not call Telegram")
+
+        def no_commands(cmd):
+            raise AssertionError(f"dry run must not run commands: {cmd}")
+
+        options = self.options(like_author=True, dry_run=True)
+        rc, text, _run, _api = self.run_setup(options, api=no_network, run=no_commands, os_name="Linux")
+        self.assertEqual(rc, 0, text)
+        self.assertIn(str(options.service_file), text)
+        self.assertIn("files already there that setup writes over: none", text)
+
+        self.prepare(options, self.FOREIGN_UNIT)
+        options.config_file.write_text("CUB_CHAT_ID=999\n", encoding="utf-8")
+        before = {item: item.read_bytes() for item in (options.config_file, options.service_file, options.token_file)}
+        rc, text, _run, _api = self.run_setup(options, api=no_network, run=no_commands, os_name="Linux")
+        self.assertEqual(rc, 0, text)
+        listed = text.split("files already there that setup writes over:", 1)[1]
+        self.assertIn(str(options.config_file), listed)
+        self.assertIn(str(options.service_file), listed)
+        self.assertIn("not written by bridge_setup.py", listed)
+        self.assertNotIn(str(options.token_file), listed, "a saved token is reused, not written over")
+        for item, body in before.items():
+            self.assertEqual(item.read_bytes(), body, item)
+        self.assertEqual(list(options.config_file.parent.glob("*.bak-*")), [])
 
 
 if __name__ == "__main__":

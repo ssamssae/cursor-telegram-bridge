@@ -11,6 +11,20 @@ Bridge](https://github.com/ssamssae/codex-telegram-bridge), and the [Grok
 Telegram Bridge](https://github.com/ssamssae/grok-telegram-bridge), but it does
 not share sessions or credentials with any of them.
 
+## New in 0.4.10
+
+`python3 bridge_setup.py doctor` checks an install at any time and changes
+nothing: `bridge.env` and the token file, the token with Telegram (`--offline`
+skips that call), `cursor-agent`, the tmux session and the Cursor inside it, the
+background service, linger on Linux, and any Cursor agent running on another
+terminal. Each line reads `[ok]`, `[warn]`, or `[fail]`, and any `[fail]` makes
+it exit with 1. Setup now ends by pointing at it. Setup also keeps a copy of a
+service file that it did not write before it replaces that file: the copy goes
+next to `bridge.env`, and an interactive setup asks first. `--dry-run` lists the
+files already there that setup would write over. See
+[When It Does Not Work](#when-it-does-not-work) and the
+[release notes](RELEASE_NOTES-0.4.10.md).
+
 ## New in 0.4.9
 
 One command now sets the bridge up the way its author runs it:
@@ -151,9 +165,13 @@ From then on, type `cursor-tg` in any terminal to land in the one Cursor
 session the bridge drives. Phone and terminal share that session, and a
 terminal that is already attached stays attached. A Cursor agent started
 anywhere else is not connected to your phone; setup warns when it sees one.
-Add `--dry-run` to print what setup would do without changing anything. To
+Add `--dry-run` to print what setup would do without changing anything,
+including the files already there that setup would write over. Setup keeps a
+copy of a service file that it did not write before it replaces that file: the
+copy goes next to `bridge.env`, and an interactive setup asks first. To
 stop the service later, run `launchctl bootout gui/$(id -u)/com.user.cursor-telegram-bridge`
 on macOS or `systemctl --user disable --now cursor-telegram-bridge` on Linux.
+Run `python3 bridge_setup.py doctor` any time to check the install again.
 
 The steps below are the manual way to do the same thing.
 
@@ -304,6 +322,30 @@ bridge does not claim that Telegram turns are covered by any particular Cursor
 plan. Check Cursor's own billing before you leave this running.
 
 ## When It Does Not Work
+
+**Start with the doctor.** In the cloned folder, run:
+
+```bash
+python3 bridge_setup.py doctor
+```
+
+It prints one line per check, marked `[ok]`, `[warn]`, or `[fail]` with a
+short reason, and it exits with 1 when any check fails. It changes nothing.
+
+- `bridge.env` and the token file exist, only your user can read them, and the
+  chat id is set. The token itself is never printed.
+- Telegram accepts the token: one `getMe` call. `--offline` skips it.
+- `cursor-agent` is found.
+- tmux is installed, the bridge's tmux session is running, and Cursor runs in
+  it. While tmux or the session is missing, each message runs one headless
+  `cursor-agent`, so the doctor warns; with `CUB_TUI_FALLBACK_HEADLESS=0` it
+  fails instead.
+- The background service is loaded (launchd) or active (`systemd --user`). On
+  Linux the doctor also checks linger. Without linger, the service stops when
+  you log out. The doctor prints the command that turns it on
+  (`sudo loginctl enable-linger $USER`); it does not run it.
+- A Cursor agent that runs on another terminal is not connected to your phone.
+  The doctor warns about it; use `cursor-tg` instead.
 
 **Nothing comes back at all.**
 Check the terminal where you started the bridge. If it says the token file is
