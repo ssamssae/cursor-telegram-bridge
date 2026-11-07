@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""cursor-tg: attach this terminal to the Cursor session the Telegram bridge drives.
+
+`python3 bridge_setup.py setup` links this file as ~/.local/bin/cursor-tg. It reads
+the tmux socket and session from bridge.env, starts Cursor there when the
+session is missing, and never detaches another terminal that is already attached.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from bridge_setup import attach_main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(attach_main())
