@@ -178,6 +178,11 @@ APPROVAL_POLL_INTERVAL = float_env("CUB_APPROVAL_POLL_INTERVAL", 1.0)
 CHOICE_CALLBACK_PREFIX = "cub-choice"
 CHOICE_DONE_CALLBACK = f"{CHOICE_CALLBACK_PREFIX}:done"
 CHOICE_SURFACE_ENABLED = bool_env("CUB_CHOICE_SURFACE", True)
+# T-261107-009 (코덱스 T-261107-007 과 같은 계약): 사용자의 답을 기다리는 카드(승인·선택·ACP 권한)의
+# 원본 메시지를 소유자 개인 대화에서 조용히 고정하고, 답·닫힘·만료 때 그 카드만 해제한다.
+QUESTION_PIN_TTL = 3600
+QUESTION_PIN_MAX_ATTEMPTS = 3
+QUESTION_PIN_RETRY_SEC = 60.0
 # /clear after Ctrl+C + --resume: lsof can miss store.db for a couple seconds.
 RESET_IDENTITY_RETRY_SEC = float_env("CUB_RESET_IDENTITY_RETRY_SEC", 2.5)
 RESET_IDENTITY_RETRY_INTERVAL = float_env("CUB_RESET_IDENTITY_RETRY_INTERVAL", 0.4)
@@ -358,6 +363,7 @@ SUGGESTED_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.suggested.
 MODEL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.model.json")
 APPROVAL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.approval.json")
 CHOICE_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.choice.json")
+QUESTION_PIN_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.question-pins.json")
 REPLY_CARD_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.reply-card.json")
 API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 
@@ -4264,6 +4270,7 @@ def surface_tui_approval():
             "ts": time.time(),
         }
     )
+    register_question_pin(f"approval:{cid}", _first_sent_message_id(result))
     print(f"{LOG_KEY} approval 버튼 노출", flush=True)
     return 1
 
@@ -4287,6 +4294,10 @@ def approval_surface_ticker():
             surface_tui_model_picker()
         except Exception as exc:  # noqa: BLE001
             print(f"{LOG_KEY} model 피커 감시 실패: {exc}", file=sys.stderr)
+        try:
+            sync_question_pins()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{LOG_KEY} 질문 카드 고정 정리 실패: {type(exc).__name__}", file=sys.stderr)
         time.sleep(APPROVAL_POLL_INTERVAL)
 
 
@@ -4311,6 +4322,162 @@ def clear_choice_store():
         os.unlink(CHOICE_STORE_FILE)
     except FileNotFoundError:
         pass
+
+
+# ── 미응답 질문 카드 고정 (T-261107-009) ─────────────────────────────────────────
+# 코덱스 브릿지 T-261107-007 과 같은 계약. 고정은 표시일 뿐 답변·권한·완료 근거가 아니다.
+# - 대상 = 봇이 보낸 열린 질문 카드(승인·선택·ACP 권한)의 원본 메시지, 소유자 개인 대화에서만.
+# - 열려 있는 동안 조용히 고정(pinChatMessage), 답·닫힘·만료 때 그 카드만 해제(unpinChatMessage).
+#   unpinAllChatMessages 는 쓰지 않는다. 사용자가 직접 고정한 메시지는 건드리지 않는다.
+# - 틱당 네트워크 호출 최대 1회. 고정/해제별 60초 간격 최대 3회. 호출 전에 소유 필드를 저장해
+#   응답이 유실돼도 그 카드만 해제할 수 있다. 네트워크 I/O 는 잠금 밖에서 한다.
+_QUESTION_PIN_LOCK = threading.Lock()
+
+
+def _read_question_pin_store():
+    try:
+        with open(QUESTION_PIN_STORE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_question_pin_store(store):
+    tmp = QUESTION_PIN_STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(store, fh, ensure_ascii=False)
+    os.replace(tmp, QUESTION_PIN_STORE_FILE)
+
+
+def _question_pin_message_id(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        mid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return mid if mid > 0 else None
+
+
+def register_question_pin(key, message_id, *, chat_id=None, created=None, **extra):
+    """카드를 보낸 직후 호출한다. message_id 가 없거나 불확실하면 고정 대상이 아니다."""
+    mid = _question_pin_message_id(message_id)
+    if not key or mid is None:
+        return False
+    item = {
+        "message_id": mid,
+        "message_chat_id": str(CHAT_ID if chat_id is None else chat_id),
+        "created": float(time.time() if created is None else created),
+        "status": "open",
+    }
+    item.update(extra)
+    with _QUESTION_PIN_LOCK:
+        store = _read_question_pin_store()
+        store[str(key)] = item
+        _write_question_pin_store(store)
+    return True
+
+
+def resolve_question_pin(key, status="answered"):
+    """답변·닫힘을 기록한다. 고정 해제는 다음 틱의 sync_question_pins 가 한다."""
+    with _QUESTION_PIN_LOCK:
+        store = _read_question_pin_store()
+        item = store.get(str(key))
+        if not item or item.get("status") == status:
+            return False
+        item["status"] = status
+        _write_question_pin_store(store)
+    return True
+
+
+def _question_card_pending(key, item, now):
+    created = item.get("created")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        return False
+    if not (0 <= now - created < QUESTION_PIN_TTL):
+        return False
+    if item.get("status") not in {"open", "uncertain"}:
+        return False
+    kind, _, cid = str(key).partition(":")
+    if kind == "approval":
+        current = _read_approval_store()
+    elif kind == "choice":
+        current = _read_choice_store()
+    else:
+        return True
+    return bool(cid) and str(current.get("cid") or "") == cid and not current.get("handled")
+
+
+def sync_question_pins(now=None):
+    """이 기능이 관리하는 고정만 맞춘다. 틱당 텔레그램 호출은 최대 1회."""
+    chat_id = str(CHAT_ID)
+    if not chat_id.isdecimal() or int(chat_id) <= 0:
+        return None
+    now = time.time() if now is None else now
+    chosen = None
+    with _QUESTION_PIN_LOCK:
+        store = _read_question_pin_store()
+        drop = []
+        for key, item in store.items():
+            if not isinstance(item, dict):
+                drop.append(key)
+                continue
+            mid = item.get("message_id")
+            if isinstance(mid, bool) or type(mid) is not int or mid <= 0 \
+                    or item.get("message_chat_id") != chat_id:
+                continue
+            pending = _question_card_pending(key, item, now)
+            if pending and item.get("pin_confirmed") is True:
+                continue
+            if not pending and not item.get("pin_managed"):
+                drop.append(key)  # 고정한 적 없는 닫힌 카드는 치울 것이 없다.
+                continue
+            action = "pinChatMessage" if pending else "unpinChatMessage"
+            same_action = item.get("pin_action") == action
+            if same_action and (item.get("pin_attempts", 0) >= QUESTION_PIN_MAX_ATTEMPTS
+                                or now < item.get("pin_retry_at", 0)):
+                continue
+            attempt = item.get("pin_attempts", 0) + 1 if same_action else 1
+            item.update(pin_managed=True, pin_confirmed=None, pin_action=action,
+                        pin_attempts=attempt, pin_retry_at=now + QUESTION_PIN_RETRY_SEC)
+            chosen = (key, mid, action, attempt, pending)
+            break
+        for key in drop:
+            store.pop(key, None)
+        if chosen or drop:
+            _write_question_pin_store(store)
+    if chosen is None:
+        return None
+    key, mid, action, attempt, pending = chosen
+    params = {"chat_id": chat_id, "message_id": mid}
+    if pending:
+        params["disable_notification"] = "true"
+    try:
+        result = tg(action, timeout=5, **params)
+    except Exception:  # noqa: BLE001
+        result = None
+    if not (isinstance(result, dict) and result.get("ok") is True and result.get("result") is True):
+        return action  # 소유권과 재시도 상한은 유지하고 답변 경로는 건드리지 않는다.
+    with _QUESTION_PIN_LOCK:
+        store = _read_question_pin_store()
+        item = store.get(key)
+        if (not isinstance(item, dict) or item.get("message_id") != mid
+                or item.get("pin_action") != action or item.get("pin_attempts") != attempt):
+            return action
+        if pending:
+            item["pin_confirmed"] = True
+        else:
+            store.pop(key, None)  # 해제 확인 = 소유 종료
+        _write_question_pin_store(store)
+    return action
+
+
+class _QuestionPinHooks:
+    """ACP 통로(cursor_acp_bridge)가 브릿지 모듈을 import 하지 않고 카드를 등록·해결하는 창구."""
+
+    register = staticmethod(register_question_pin)
+    resolve = staticmethod(resolve_question_pin)
 
 
 def choice_menu_markup(cid, options):
@@ -4398,6 +4565,7 @@ def surface_tui_choice_menu():
             "ts": time.time(),
         }
     )
+    register_question_pin(f"choice:{cid}", _first_sent_message_id(result))
     print(f"{LOG_KEY} choice 버튼 노출 {labels}", flush=True)
     return 1
 
@@ -4450,6 +4618,7 @@ def handle_choice_callback(data, answer, message=None):
     current["handled_key"] = key
     current["handled_at"] = time.time()
     _write_choice_store(current)
+    resolve_question_pin(f"choice:{cid}", "answered")
     print(f"{LOG_KEY} choice [{key}] 선택", flush=True)
 
 
@@ -4930,6 +5099,7 @@ def handle_telegram_callback(callback, update_id=None):
         current["handled_at"] = time.time()
         current["choice"] = option
         _write_approval_store(current)
+        resolve_question_pin(f"approval:{cid_part}", "answered")
         print(f"{LOG_KEY} approval {option} 선택", flush=True)
         return
     prefix = f"{SUGGESTED_CALLBACK_PREFIX}:"
@@ -5599,6 +5769,10 @@ def acp_terminal_mirror_loop():
                     scheduled.add(str(path))
                     JOBS.put(("acp-recovery", "", {"acp_outbox": str(path)}))
         except Exception as exc: print(f"{LOG_KEY} ACP terminal mirror: {type(exc).__name__}", file=sys.stderr)
+        try:
+            sync_question_pins()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{LOG_KEY} 질문 카드 고정 정리 실패: {type(exc).__name__}", file=sys.stderr)
         time.sleep(3)
 
 
@@ -5608,7 +5782,7 @@ def acp_bridge():
         from cursor_acp_bridge import AcpBridge
         socket_path = os.environ["CUB_ACP_SOCKET"]
         _ACP_BRIDGE = AcpBridge(socket_path, Path(socket_path).parent / "telegram-outbox",
-                                deliver_mesh_event, CursorFlowCard)
+                                deliver_mesh_event, CursorFlowCard, pins=_QuestionPinHooks)
     return _ACP_BRIDGE
 
 
