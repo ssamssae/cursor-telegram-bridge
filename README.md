@@ -11,6 +11,18 @@ Bridge](https://github.com/ssamssae/codex-telegram-bridge), and the [Grok
 Telegram Bridge](https://github.com/ssamssae/grok-telegram-bridge), but it does
 not share sessions or credentials with any of them.
 
+## New in 0.4.11
+
+`/model` now builds its buttons from the models Cursor offers
+(`cursor-agent models`), so a new model shows up without a bridge update. The
+list is cached in the state directory and refreshed in the background every six
+hours (`CUB_MODEL_MENU_TTL_S`); `CUB_MODEL_MENU` still overrides it. A version
+number is matched whole: `opus 5` picks Opus 5, never Opus 5.5. Telegram polling
+is sturdier too: `getUpdates` now long-polls for 30 seconds, a failed poll logs
+its reason without the URL or token and waits longer each time (up to 60
+seconds), and after 30 failures in a row or 10 minutes the bridge exits so the
+background service restarts it. See the [release notes](RELEASE_NOTES-0.4.11.md).
+
 ## New in 0.4.10
 
 `python3 bridge_setup.py doctor` checks an install at any time and changes
@@ -104,8 +116,8 @@ These work in the TUI lane (a live `cursor` tmux session):
 
 | You send | What happens |
 | --- | --- |
-| `/model` | A button menu of Cursor models. Tap one and the bridge switches the Cursor session to it (`CUB_MODEL_MENU` sets the list). |
-| `/model opus 5` | Switch straight to the first model whose name contains that text, no menu. |
+| `/model` | A button menu of the models Cursor offers, read from `cursor-agent models`, so new models show up on their own. Tap one and the bridge switches the Cursor session to it. |
+| `/model opus 5` | Switch straight to the model whose name contains that text, no menu. A version number is matched whole: `opus 5` picks Opus 5, never Opus 5.5. |
 | `/context` | Cursor's own context usage line comes back to your phone. |
 | `/clear` | Starts a fresh Cursor conversation, same as typing it in the terminal. |
 | `/status` | One line: is the bridge polling, is the worker alive, how deep is the queue. |
@@ -310,7 +322,8 @@ Every setting is an environment variable. Only the first two are required.
 | `CUB_CONTEXT_CLEAR_COOLDOWN_SEC` | `600` | Minimum seconds between two automatic `/clear`s from the context guard. |
 | `CUB_TUI_FALLBACK_HEADLESS` | `1` | Set `0` to refuse work when the tmux session is gone. |
 | `CUB_TUI_MIRROR_LOCAL` | `0` | Set `1` to also send turns typed in the tmux session to Telegram. |
-| `CUB_MODEL_MENU` | built-in list | Comma-separated model names shown as `/model` buttons. |
+| `CUB_MODEL_MENU` | live list | Comma-separated model names shown as `/model` buttons. When unset, the buttons come from `cursor-agent models` (cached in the state directory). A built-in list is used only when that list and the cache are both unavailable. |
+| `CUB_MODEL_MENU_TTL_S` | `21600` | Age in seconds after which the cached `cursor-agent models` list is refreshed in the background. |
 | `CUB_MODEL_SURFACE` | `1` | Set `0` to turn off the `/model` menu and the picker mirror. |
 | `CUB_APPROVAL_SURFACE` | `1` | Set `0` to stop sending the Run Everything button on approval prompts. |
 | `CUB_PHONE_MAX_LINES` | `0` | `0` sends the whole answer. A positive number cuts the phone copy at that many lines. |
