@@ -17,6 +17,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -198,15 +199,22 @@ RESET_IDENTITY_EMPTY_STORE_MSG = (
 MODEL_CALLBACK_PREFIX = "cub-model"
 MODEL_CLOSE_CALLBACK = f"{MODEL_CALLBACK_PREFIX}:close"
 MODEL_PAGE_CALLBACK = f"{MODEL_CALLBACK_PREFIX}:page"
-MODEL_MENU = tuple(
-    m.strip()
-    for m in env(
-        "CUB_MODEL_MENU",
-        "Claude Fable 5.1,Claude Opus 5,GPT-5.6 Sol,GPT-5.5,Composer 2.5,"
-        "Claude Fable 5,Claude Opus 4.8,Cursor Grok 4.6,Cursor Grok 4.5,Gemini 3.8 Flash,Gemini 3.7 Flash",
-    ).split(",")
-    if m.strip()
+# T-261116-006: 버튼 목록은 Cursor CLI 의 실제 목록(`cursor-agent models`)에서 만든다. 새 모델이
+# 나오면 코드 수정 없이 메뉴에 뜬다. 우선순위 = CUB_MODEL_MENU(명시) > 실측 목록(캐시) > 아래 고정 목록.
+# 고정 목록은 실측·캐시가 모두 없을 때만 쓴다(2026-11-16 실측 기준, 목록에서 빠진 Gemini 3.7 Flash 제외).
+MODEL_MENU_STATIC = (
+    "Claude Opus 5.5", "Claude Fable 5.2", "Claude Fable 5.1", "Claude Opus 5", "GPT-5.6 Sol", "GPT-5.5",
+    "Composer 2.5", "Claude Fable 5", "Claude Opus 4.8", "Grok 4.6", "Grok 4.5", "Gemini 3.8 Flash",
 )
+_MODEL_MENU_ENV = tuple(m.strip() for m in (env("CUB_MODEL_MENU") or "").split(",") if m.strip())
+MODEL_MENU_OVERRIDE = bool(_MODEL_MENU_ENV)
+MODEL_MENU = _MODEL_MENU_ENV or MODEL_MENU_STATIC
+# 실측 목록 캐시 수명. 지나면 다음 /model 때 뒤 스레드로 새로 받고, 그동안은 있던 목록을 그린다.
+MODEL_MENU_TTL_S = int_env("CUB_MODEL_MENU_TTL_S", 6 * 3600, minimum=60)
+MODEL_LIST_TIMEOUT_S = 20
+MODEL_LIST_RETRY_S = 300.0
+# 팔레트에서 정확한 줄이 첫 줄이 아닐 때 Down 으로 옮기는 최대 칸 수.
+MODEL_NAV_MAX_STEPS = 8
 # 한 열로 11개를 쌓으면 텔레그램이 아래 버튼을 잘라 먹는다 (2026-09-06 제어 노드 스크린샷).
 MODEL_MENU_COLUMNS = int_env("CUB_MODEL_MENU_COLUMNS", 2)
 MODEL_PAGE_SIZE = int_env("CUB_MODEL_PAGE_SIZE", 12)
@@ -361,6 +369,7 @@ TUI_INFLIGHT_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.tui-inflight.
 HEADLESS_TRANSCRIPTS_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.headless-transcripts.json")
 SUGGESTED_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.suggested.json")
 MODEL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.model.json")
+MODEL_LIST_CACHE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.models-cache.json")
 APPROVAL_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.approval.json")
 CHOICE_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.choice.json")
 QUESTION_PIN_STORE_FILE = os.path.join(STATE_DIR, f"cursor-bridge-{NAME}.question-pins.json")
@@ -392,6 +401,8 @@ _HEALTH = {
     "name": NAME,
     "started_at": time.time(),
     "last_poll_at": 0.0,
+    "last_poll_ok_at": 0.0,
+    "poll_fail_streak": 0,
     "last_enqueue_at": 0.0,
     "last_job_started_at": 0.0,
     "last_job_done_at": 0.0,
@@ -493,16 +504,111 @@ def inbox_spool(update_id, source, text):
         health_mark(spool_errors=1)
 
 
+# timeout 인자는 소켓 제한이다. getUpdates 롱폴 초는 long_poll_timeout 으로만 쿼리에 넣는다.
+# 소켓 제한이 롱폴보다 짧으면 서버가 응답을 붙드는 동안 URLError 가 난다.
+GETUPDATES_LONG_POLL_SEC = 30
+GETUPDATES_SOCKET_SLACK_SEC = 15
+POLL_BACKOFF_MAX_SEC = 60
+POLL_FAIL_EXIT_STREAK = 30
+POLL_FAIL_EXIT_SEC = 600
+_POLL_FAIL_STREAK = 0
+_POLL_FAIL_MONO = None
+_SECRET_URL_RE = re.compile(r"https?://\S+", re.I)
+_SECRET_BOT_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{8,}")
+
+
+def _redact_log_text(text):
+    cleaned = _SECRET_URL_RE.sub("<redacted-url>", str(text))
+    cleaned = _SECRET_BOT_RE.sub("<redacted>", cleaned)
+    return cleaned[:200]
+
+
+def _safe_failure_text(exc):
+    """예외 종류·HTTP code·errno·reason 만. URL 과 토큰은 넣지 않는다."""
+    reason = getattr(exc, "reason", None)
+    errno_no = getattr(exc, "errno", None)
+    if errno_no is None and isinstance(reason, BaseException):
+        errno_no = getattr(reason, "errno", None)
+    code = getattr(exc, "code", None)
+    if isinstance(reason, BaseException):
+        detail = getattr(reason, "strerror", None) or ""
+        if not detail and reason.args:
+            detail = str(reason.args[0])
+        reason_text = type(reason).__name__
+        if detail:
+            reason_text = f"{reason_text}: {detail}"
+    elif reason not in (None, ""):
+        reason_text = str(reason)
+    else:
+        reason_text = ""
+    parts = [type(exc).__name__]
+    if code is not None:
+        parts.append(f"code={code}")
+    if errno_no is not None:
+        parts.append(f"errno={errno_no}")
+    if reason_text:
+        parts.append(_redact_log_text(reason_text))
+    return " ".join(parts)
+
+
+def poll_backoff_seconds(streak):
+    """연속 실패 1회부터 1, 2, 4, … 최대 60초."""
+    streak = int(streak)
+    if streak < 1:
+        return 0
+    return min(POLL_BACKOFF_MAX_SEC, 2 ** min(streak - 1, 6))
+
+
+def poll_failure_should_exit(streak, elapsed):
+    return int(streak) >= POLL_FAIL_EXIT_STREAK or float(elapsed) >= POLL_FAIL_EXIT_SEC
+
+
+def _reset_poll_failures():
+    global _POLL_FAIL_STREAK, _POLL_FAIL_MONO
+    _POLL_FAIL_STREAK = 0
+    _POLL_FAIL_MONO = None
+
+
+def _record_poll_success():
+    _reset_poll_failures()
+    now = time.time()
+    health_mark(last_poll_at=now, last_poll_ok_at=now, poll_fail_streak=0)
+
+
+def _record_poll_failure():
+    """실패 간격을 늘리고, 10분이거나 30회면 비-0 으로 종료한다."""
+    global _POLL_FAIL_STREAK, _POLL_FAIL_MONO
+    now_m = time.monotonic()
+    if _POLL_FAIL_STREAK <= 0 or _POLL_FAIL_MONO is None:
+        _POLL_FAIL_MONO = now_m
+    _POLL_FAIL_STREAK += 1
+    elapsed = now_m - _POLL_FAIL_MONO
+    health_mark(last_poll_at=time.time(), poll_fail_streak=_POLL_FAIL_STREAK)
+    if poll_failure_should_exit(_POLL_FAIL_STREAK, elapsed):
+        print(
+            f"{LOG_KEY} getUpdates 연속 실패 streak={_POLL_FAIL_STREAK} "
+            f"elapsed={elapsed:.0f}s — 감독 재시작을 위해 종료",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    time.sleep(poll_backoff_seconds(_POLL_FAIL_STREAK))
+
+
 def tg(method, timeout=60, **params):
+    long_poll = params.pop("long_poll_timeout", None)
+    socket_timeout = timeout
+    if long_poll is not None:
+        params["timeout"] = long_poll
+        socket_timeout = max(float(timeout), float(long_poll) + GETUPDATES_SOCKET_SLACK_SEC)
     if DRY_RUN or not API:
         return {"ok": True, "result": []}
     qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     url = f"{API}/{method}" + (f"?{qs}" if qs else "")
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(url, timeout=socket_timeout) as r:
             return json.loads(r.read().decode())
     except Exception as exc:  # noqa: BLE001
-        print(f"{LOG_KEY} tg {method} 실패: {type(exc).__name__}", file=sys.stderr)
+        print(f"{LOG_KEY} tg {method} 실패: {_safe_failure_text(exc)}", file=sys.stderr)
         return {}
 
 
@@ -4706,6 +4812,9 @@ def handle_choice_callback(data, answer, message=None):
 _MODEL_PICKER_HEAD_RE = re.compile(r"(?im)^\s*(?:available models|models matching\b.*)\s")
 _MODEL_PICKER_FOOT_RE = re.compile(r"(?i)(?:type|edit prompt) to filter\s*•\s*enter to select")
 _MODEL_STATUS_RE = re.compile(r"^\s*(?P<model>[A-Za-z][\w .+-]*?)\s*·")
+# 새 세션은 컨텍스트 칸이 아직 없어 상태줄에 「·」가 없다(2026-11-16 실측, T-261116-012):
+#   `  Claude Opus 5 300K High                    Run Everything`
+_MODEL_STATUS_PLAIN_RE = re.compile(r"^\s*(?P<model>[A-Za-z][\w .+-]*?)\s{2,}run everything\b", re.IGNORECASE)
 
 
 # compose 줄: 빈 placeholder 또는 우리가 부은 "/model …" (팔레트가 그 아래 열린다).
@@ -4761,7 +4870,7 @@ def _tui_current_model(screen=None):
     text = screen if screen is not None else _tui_capture_pane()
     for line in (text or "").splitlines():
         if "run everything" in line.lower():
-            m = _MODEL_STATUS_RE.match(line)
+            m = _MODEL_STATUS_RE.match(line) or _MODEL_STATUS_PLAIN_RE.match(line)
             if m:
                 # 좁은 창에서는 `GPT-5.5 272K· 37%` 처럼 컨텍스트 칸이 붙어 온다.
                 return re.sub(r"\s+\d+K$", "", m.group("model").strip())
@@ -4790,12 +4899,111 @@ def _tui_erase_compose(chars):
     time.sleep(MODEL_KEY_DELAY)
 
 
+# ── 모델 이름 접기·맞추기 (T-261116-006) ──────────────────────────────────────
+# `cursor-agent models` 는 `<id> - <Label>` 한 줄에 변형 하나다(예: `Claude Opus 5.5 1M High Fast`).
+# TUI 피커·상태줄은 기본 이름에 문맥·노력을 붙여 보인다(`Claude Opus 5.5 300K Extra High`).
+# 둘 다 같은 규칙으로 기본 이름까지 접어 비교한다.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff]")
+_MODEL_VARIANT_TAIL_RE = re.compile(
+    r"\s+(?:\d+(?:\.\d+)?[KkMm]|None|Minimal|Low|Medium|High|Extra\s+High|Extra|XHigh|Max|"
+    r"No\s+Thinking|Thinking|Fast)$",
+    re.IGNORECASE,
+)
+
+
+def _fold_model_label(label):
+    """변형 꼬리(1M·300K·노력·Thinking·Fast)·괄호(NO ZDR)·폭 없는 글자를 걷어 기본 이름만 남긴다."""
+    s = _ZERO_WIDTH_RE.sub("", _ANSI_ESCAPE_RE.sub("", str(label or "")))
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    while True:
+        folded = _MODEL_VARIANT_TAIL_RE.sub("", s).strip()
+        if folded == s:
+            return s
+        s = folded
+
+
+def _model_key(name):
+    return _fold_model_label(name).lower()
+
+
+def _model_boundary_match(want_key, row_key):
+    """want 가 row 안에 단어 경계로 들어 있는가. 버전이 이어지면 아니다("opus 5" ≠ "opus 5.5")."""
+    if not want_key or not row_key:
+        return False
+    pattern = r"(?<![0-9a-z])" + re.escape(want_key) + r"(?![0-9]|\.[0-9])"
+    return re.search(pattern, row_key) is not None
+
+
+def _known_model_keys():
+    return {_model_key(n) for n in list(MODEL_MENU) + model_menu_names(refresh=False) if n}
+
+
+def _pick_model_row(want, rows, known_keys=frozenset()):
+    """피커 줄 [(선택됨, 이름)] 에서 want 에 맞는 줄 번호. 없으면 None.
+
+    1) 접은 이름이 같은 줄이 먼저다(맨 위가 아니어도).
+    2) 없으면 단어 경계로 들어 있는 줄. 지금 선택된 줄이 맞으면 그 줄(옛 동작), 아니면 첫 줄.
+       메뉴에 있는 모델 이름을 골랐으면 메뉴의 다른 모델 줄은 맞는 줄로 치지 않는다
+       ("GPT-5.4" 가 "GPT-5.4 Mini" 를 고르면 안 된다).
+    """
+    want_key = _model_key(want)
+    if not want_key or not rows:
+        return None
+    keys = [_model_key(name) for _sel, name in rows]
+    for idx, key in enumerate(keys):
+        if key == want_key:
+            return idx
+    exact_known = want_key in known_keys
+    candidates = [
+        idx for idx, key in enumerate(keys)
+        if _model_boundary_match(want_key, key) and not (exact_known and key in known_keys and key != want_key)
+    ]
+    if not candidates:
+        return None
+    selected = next((i for i, (sel, _n) in enumerate(rows) if sel), None)
+    return selected if selected in candidates else candidates[0]
+
+
+def _tui_selected_model_row(screen):
+    rows = _tui_model_picker_rows(screen)
+    return next((name for sel, name in rows if sel), None)
+
+
+def _tui_move_model_selection(rows, start, target):
+    """팔레트 → 줄을 Down 으로 target 까지 옮긴다. 한 칸마다 화면을 다시 읽어 그 줄이 선택됐는지 확인한다.
+
+    Up 은 쓰지 않는다 — 입력칸의 이전 글 넘기기와 겹칠 수 있다. 확인이 한 번이라도 어긋나면
+    (False, 화면) 이고 호출자가 입력칸을 비운다. Enter 는 여기서 치지 않는다.
+    """
+    if start is None or target is None or target <= start or target - start > MODEL_NAV_MAX_STEPS:
+        return False, ""
+    screen = ""
+    for step in range(start + 1, target + 1):
+        expected = _model_key(rows[step][1])
+        _tmux("send-keys", "-t", TMUX_PANE, "Down")
+
+        def moved(s, expected=expected):
+            if not _tui_pane_shows_model_picker(s):
+                return False
+            name = _tui_selected_model_row(s)
+            return name is not None and _model_key(name) == expected
+
+        ok, screen = _tui_wait_screen(moved, MODEL_PICKER_WAIT)
+        if not ok:
+            return False, screen
+    return True, screen
+
+
 def tui_select_model(target):
-    """compose 에 "/model <target>" 를 붓고 팔레트 → 줄이 target 이면 Enter. (ok, 메시지).
+    """compose 에 "/model <target>" 를 붓고 팔레트에서 target 줄을 골라 Enter. (ok, 메시지).
 
     피커 안에서 글자를 치는 길은 버렸다: 매치 목록이 줄어들 때마다 재렌더가 키를 삼켜
     0.4초 간격으로도 "fable 5.1" 이 "ble 5.1" 로 들어갔다(2026-09-04 20:3x 실측). 팔레트
     인자형("/model [filter]")은 compose 붓기라 한 덩이로 들어가고 Enter 가 바로 확정한다.
+    T-261116-006: "Claude Opus 5" 필터에는 "Claude Opus 5.5" 도 걸린다. 맞는 줄이 첫 줄이 아니면
+    Down 으로 옮기고 확인한 뒤에만 Enter 를 친다. 맞는 줄이 없으면 다른 모델을 고르지 않는다.
     """
     want = (target or "").strip()
     if not want:
@@ -4825,21 +5033,35 @@ def tui_select_model(target):
 
     ok, screen = _tui_wait_screen(palette_ready, MODEL_PICKER_WAIT)
     rows = _tui_model_picker_rows(screen) if ok else []
-    chosen = [n for sel, n in rows if sel]
-    if not chosen or want.lower() not in chosen[0].lower():
+    selected = next((i for i, (sel, _n) in enumerate(rows) if sel), None)
+    pick = _pick_model_row(want, rows, _known_model_keys())
+    if pick is None or selected is None:
         _tui_erase_compose(len(typed) + 2)
         if not ok or not rows:
             return False, f"'{want}'에 맞는 모델이 없습니다. 입력칸을 비웠습니다."
-        return False, f"'{want}' 로는 {chosen[0] if chosen else rows[0][1]} 이(가) 골라져서 넣지 않았습니다. 이름을 더 정확히 보내 주세요."
+        shown = rows[selected][1] if selected is not None else rows[0][1]
+        return False, f"'{want}' 로는 {shown} 이(가) 골라져서 넣지 않았습니다. 이름을 더 정확히 보내 주세요."
+    chosen = rows[pick][1]
+    navigated = pick != selected
+    if navigated:
+        moved, screen = _tui_move_model_selection(rows, selected, pick)
+        if not moved:
+            _tui_erase_compose(len(typed) + 2)
+            return False, f"'{want}' 줄({chosen})로 옮기지 못해 넣지 않았습니다. 입력칸을 비웠습니다."
     _tmux("send-keys", "-t", TMUX_PANE, "Enter")
     ok, screen = _tui_wait_screen(lambda s: not _tui_pane_shows_model_picker(s), MODEL_PICKER_WAIT)
     if not ok:
         return False, "선택은 넣었지만 창이 닫히지 않았습니다. 커서 화면을 확인해 주세요."
     time.sleep(0.5)
+    if navigated:
+        # 옮겨 고른 줄은 상태줄이 그 모델로 바뀌는 것까지 본다. 다르면 성공이라고 하지 않는다.
+        _tui_wait_screen(lambda s: _model_key(_tui_current_model(s)) == _model_key(chosen), MODEL_PICKER_WAIT)
     now = _tui_current_model()
-    if now and want.lower() in now.lower():
+    if now and (_model_key(now) == _model_key(chosen) or (not navigated and want.lower() in now.lower())):
         return True, f"모델 → {now}"
-    return True, f"모델 {chosen[0]}을(를) 선택했습니다" + (f" (상태줄: {now})" if now else "")
+    if now and navigated:
+        return False, f"{chosen} 줄을 골랐지만 상태줄은 {now} 입니다. 커서 화면을 확인해 주세요."
+    return True, f"모델 {chosen}을(를) 선택했습니다" + (f" (상태줄: {now})" if now else "")
 
 
 def _read_model_store():
@@ -4858,9 +5080,185 @@ def _write_model_store(store):
     os.replace(tmp, MODEL_STORE_FILE)
 
 
-def model_menu_markup(current="", page=0):
+# ── /model 버튼 목록 = `cursor-agent models` 실측 (T-261116-006) ────────────────
+# 2026-11-16 실측(CLI 2026.11.13): "Available models", 빈 줄, `<id> - <Label>` 280줄, 빈 줄, "Tip: …".
+# 변형(문맥·노력·Fast·Thinking)을 접어 기본 이름 하나로 묶고, 주력 가족마다 최신판이 먼저 오게
+# 줄 세운다. Auto 는 뺀다(옛 고정 목록에도 없었다. 손으로 `/model auto` 는 그대로 된다).
+_CURSOR_MODELS_LINE_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._\-]*)\s+-\s+(\S.*?)\s*$")
+_MODEL_MAIN_FAMILIES = (
+    re.compile(r"^claude opus\b", re.IGNORECASE),
+    re.compile(r"^claude fable\b", re.IGNORECASE),
+    re.compile(r"^claude sonnet\b", re.IGNORECASE),
+    re.compile(r"^gpt\b", re.IGNORECASE),
+    re.compile(r"^composer\b", re.IGNORECASE),
+    re.compile(r"^(?:cursor )?grok\b", re.IGNORECASE),
+    re.compile(r"^gemini\b", re.IGNORECASE),
+)
+_MODEL_LIST_LOCK = threading.Lock()
+_MODEL_LIST_STATE = {"running": False, "attempt_at": 0.0}
+
+
+def _model_version(name):
+    m = re.search(r"\d+(?:\.\d+)*", name or "")
+    return tuple(int(p) for p in m.group(0).split(".")) if m else ()
+
+
+def _sort_model_names(names):
+    """주력 가족(Claude Opus·Fable·Sonnet·GPT·Composer·Grok·Gemini)을 돌아가며 최신판부터,
+    그다음 나머지(첫 단어순·최신판부터). 같은 판은 CLI 목록 순서를 지킨다."""
+    families = {}
+    others = []
+    for name in names:
+        fam = next((i for i, rx in enumerate(_MODEL_MAIN_FAMILIES) if rx.search(name)), None)
+        (others if fam is None else families.setdefault(fam, [])).append(name)
+    ranked = []
+    for fam, members in families.items():
+        for rank, name in enumerate(sorted(members, key=_model_version, reverse=True)):
+            ranked.append((rank, fam, name))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    others = sorted(sorted(others, key=_model_version, reverse=True), key=lambda n: n.split(" ", 1)[0].lower())
+    return [name for _rank, _fam, name in ranked] + others
+
+
+def parse_cursor_models(text):
+    """`cursor-agent models` 출력 → 접은 모델 이름 목록. 읽을 줄이 없으면 []."""
+    names = []
+    seen = set()
+    for raw in (text or "").splitlines():
+        line = _ZERO_WIDTH_RE.sub("", _ANSI_ESCAPE_RE.sub("", raw))
+        m = _CURSOR_MODELS_LINE_RE.match(line)
+        if not m:
+            continue
+        model_id = m.group(1).lower()
+        name = _fold_model_label(m.group(2))
+        if model_id in ("auto", "default") or not name or name.lower() == "auto":
+            continue
+        # `cursor-grok-4.6-*` 도 CLI 이름 그대로 쓴다: 2026-11-16 01:5x 실측 TUI 피커는 "Grok 4.6"
+        # 이다(9월 상태줄의 "Cursor Grok" 이 아니다). 앞에 "Cursor " 를 붙이면 그 버튼은 못 고른다.
+        # 텔레그램 callback_data 는 64바이트까지다. 넘치는 이름은 버튼으로 못 고른다.
+        if len(f"{MODEL_CALLBACK_PREFIX}:{name}".encode("utf-8")) > 64:
+            continue
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        names.append(name)
+    return _sort_model_names(names)
+
+
+def _cursor_cli_path():
+    found = shutil.which(CURSOR_BIN)
+    if found:
+        return found
+    fallback = os.path.join(HOME, ".local", "bin", "cursor-agent")
+    return fallback if os.path.isfile(fallback) and os.access(fallback, os.X_OK) else ""
+
+
+def _run_cursor_models():
+    path = _cursor_cli_path()
+    if not path:
+        raise FileNotFoundError(f"{CURSOR_BIN} not found")
+    proc = subprocess.run(
+        [path, "models"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=MODEL_LIST_TIMEOUT_S,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"rc={proc.returncode}")
+    return proc.stdout or ""
+
+
+def _read_model_list_cache():
+    """(이름 목록, 받은 시각). 없거나 깨졌으면 ([], 0.0)."""
+    try:
+        with open(MODEL_LIST_CACHE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return [], 0.0
+    if not isinstance(data, dict) or not isinstance(data.get("names"), list):
+        return [], 0.0
+    names = [n.strip() for n in data["names"] if isinstance(n, str) and n.strip()]
+    try:
+        ts = float(data.get("ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    return names, ts
+
+
+def _write_model_list_cache(names):
+    tmp = f"{MODEL_LIST_CACHE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"ts": time.time(), "names": list(names)}, fh, ensure_ascii=False)
+    os.replace(tmp, MODEL_LIST_CACHE_FILE)
+
+
+def refresh_model_list_cache():
+    """`cursor-agent models` 를 읽어 캐시를 새로 쓴다. 실패·0개면 캐시를 건드리지 않고 []."""
+    try:
+        names = parse_cursor_models(_run_cursor_models())
+    except Exception as exc:  # noqa: BLE001
+        print(f"{LOG_KEY} model 목록 갱신 실패: {type(exc).__name__}: {_redact_log_text(exc)}", file=sys.stderr)
+        return []
+    if not names:
+        print(f"{LOG_KEY} model 목록 갱신 실패: 읽은 모델 0개", file=sys.stderr)
+        return []
+    _write_model_list_cache(names)
+    print(f"{LOG_KEY} model 목록 갱신 {len(names)}개", flush=True)
+    return names
+
+
+def _model_list_refresh_worker():
+    try:
+        refresh_model_list_cache()
+    finally:
+        with _MODEL_LIST_LOCK:
+            _MODEL_LIST_STATE["running"] = False
+
+
+def _start_model_list_refresh():
+    """뒤 스레드로 한 번만 새로 받는다. 텔레그램 루프는 기다리지 않는다. 시작했으면 True."""
+    if MODEL_MENU_OVERRIDE or DRY_RUN:
+        return False
+    with _MODEL_LIST_LOCK:
+        now = time.time()
+        if _MODEL_LIST_STATE["running"] or now - _MODEL_LIST_STATE["attempt_at"] < MODEL_LIST_RETRY_S:
+            return False
+        _MODEL_LIST_STATE.update(running=True, attempt_at=now)
+    try:
+        threading.Thread(target=_model_list_refresh_worker, name="cub-model-list", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        with _MODEL_LIST_LOCK:
+            _MODEL_LIST_STATE["running"] = False
+        raise
+    return True
+
+
+def model_menu_names(refresh=True):
+    """메뉴에 그릴 모델 이름. CUB_MODEL_MENU(명시) > 실측 목록 캐시 > 고정 목록.
+    캐시가 없거나 CUB_MODEL_MENU_TTL_S 가 지났으면 뒤에서 새로 받고, 이번에는 있는 목록을 그린다."""
+    if MODEL_MENU_OVERRIDE:
+        return list(MODEL_MENU)
+    names, ts = _read_model_list_cache()
+    age = time.time() - ts
+    if refresh and (not names or age < 0 or age > MODEL_MENU_TTL_S):
+        _start_model_list_refresh()
+    return names or list(MODEL_MENU)
+
+
+def _stored_menu_names(store):
+    names = store.get("menu_names") if isinstance(store, dict) else None
+    if not isinstance(names, list):
+        return []
+    return [n for n in names if isinstance(n, str) and n.strip()]
+
+
+def model_menu_markup(current="", page=0, names=None):
     """모델 버튼을 2열·페이지로 나눈다. 한 줄 스택은 텔레그램이 아래를 자른다."""
-    names = list(MODEL_MENU)
+    names = list(names) if names else model_menu_names()
+    current_key = _model_key(current) if current else ""
     size = max(1, int(MODEL_PAGE_SIZE))
     cols = max(1, int(MODEL_MENU_COLUMNS))
     pages = max(1, (len(names) + size - 1) // size) if names else 1
@@ -4873,7 +5271,8 @@ def model_menu_markup(current="", page=0):
     rows = []
     row = []
     for name in chunk:
-        mark = "✅ " if current and name.lower() == current.lower() else ""
+        # 상태줄은 `Claude Opus 5.5 300K Extra` 처럼 문맥·노력이 붙는다. 접은 이름으로 비교한다.
+        mark = "✅ " if current_key and _model_key(name) == current_key else ""
         row.append({"text": f"{mark}{name}", "callback_data": f"{MODEL_CALLBACK_PREFIX}:{name}"[:64]})
         if len(row) >= cols:
             rows.append(row)
@@ -4905,12 +5304,14 @@ def handle_model_command(text):
         return
     current = _tui_current_model() if tui_session_alive() else ""
     label = current or "모름"
+    names = model_menu_names()
     result = deliver_mesh_event(
         "report",
         tr('현재 커서 모델: {v0}\n바꿀 모델을 골라 주세요. 누르면 커서 창에 바로 적용합니다.', v0=label),
-        reply_markup=model_menu_markup(current),
+        reply_markup=model_menu_markup(current, names=names),
     )
-    _write_model_store({"menu_message_id": _first_sent_message_id(result), "ts": time.time()})
+    # 그린 목록을 남겨 둔다 — 그 사이 목록이 새로 받아져도 이 메뉴의 버튼·페이지가 그대로 먹는다.
+    _write_model_store({"menu_message_id": _first_sent_message_id(result), "ts": time.time(), "menu_names": names})
 
 
 def surface_tui_model_picker():
@@ -4927,14 +5328,17 @@ def surface_tui_model_picker():
     if store.get("picker_open"):
         return 0
     current = _tui_current_model(screen)
+    names = model_menu_names()
     result = deliver_mesh_event(
         "report",
         tr('커서 모델 선택창이 열렸습니다. 여기서 고르셔도 됩니다.'),
-        reply_markup=model_menu_markup(current),
+        reply_markup=model_menu_markup(current, names=names),
     )
     if not _mesh_delivery_sent(result):
         return 0
-    store.update({"picker_open": True, "menu_message_id": _first_sent_message_id(result), "ts": time.time()})
+    store.update(
+        {"picker_open": True, "menu_message_id": _first_sent_message_id(result), "ts": time.time(), "menu_names": names}
+    )
     _write_model_store(store)
     print(f"{LOG_KEY} model 피커 노출", flush=True)
     return 1
@@ -4964,14 +5368,19 @@ def handle_model_callback(data, answer, message=None):
                     timeout=10,
                     chat_id=CHAT_ID,
                     message_id=int(mid),
-                    reply_markup=model_menu_markup(current, page=page),
+                    reply_markup=model_menu_markup(
+                        current, page=page, names=_stored_menu_names(_read_model_store()) or None
+                    ),
                 )
             except (TypeError, ValueError, Exception) as exc:  # noqa: BLE001
                 print(f"{LOG_KEY} model page edit 실패: {exc}", file=sys.stderr)
         answer()
         return
     name = data[len(MODEL_CALLBACK_PREFIX) + 1 :].strip()
+    # 버튼 이름만 TUI 에 친다: 지금 목록 + 그 메뉴를 그릴 때 남긴 목록 + 고정·명시 목록.
     allowed = {m.lower() for m in MODEL_MENU}
+    allowed |= {m.lower() for m in model_menu_names(refresh=False)}
+    allowed |= {m.lower() for m in _stored_menu_names(_read_model_store())}
     if name.lower() not in allowed:
         answer(tr('메뉴에 없는 모델입니다.'))
         return
@@ -6409,11 +6818,16 @@ def telegram_poller():
     offset = _read(OFFSET_FILE)
     offset = int(offset) if offset.isdigit() else 0
     while True:
-        res = tg("getUpdates", offset=offset, timeout=30)
-        health_mark(last_poll_at=time.time())
+        res = tg(
+            "getUpdates",
+            offset=offset,
+            timeout=GETUPDATES_LONG_POLL_SEC,
+            long_poll_timeout=GETUPDATES_LONG_POLL_SEC,
+        )
         if not res or not res.get("ok"):
-            time.sleep(3)
+            _record_poll_failure()
             continue
+        _record_poll_success()
         for upd in res.get("result", []):
             try:
                 callback = upd.get("callback_query")
@@ -6517,6 +6931,8 @@ def main():
         threading.Thread(target=acp_terminal_mirror_loop, daemon=True).start()
         telegram_poller()
         return
+    # T-261116-006: /model 버튼 목록 캐시가 없거나 낡았으면 뒤 스레드로 미리 받아 둔다(기다리지 않는다).
+    model_menu_names()
     if os.environ.get('AGENT_CONTROL_ENABLED') == '1':
         try:
             from agent_control_adapters import start_control
